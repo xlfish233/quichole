@@ -1,0 +1,23 @@
+[package]
+name = "quichole-shr"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+quiche.workspace = true
+tokio.workspace = true
+serde.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+ring.workspace = true
+bytes.workspace = true
+tokio-quiche.workspace = true
+toml.workspace = true
+bincode = "1.3"
+sha2 = "0.10"
+
+[dev-dependencies]
+tokio-test = "0.4"
