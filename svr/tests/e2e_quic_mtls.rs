@@ -7,7 +7,10 @@ use quichole_shr::config::{
 };
 use quichole_svr::runtime::run_server;
 use quichole_svr::server::ServerState;
-use rcgen::{CertificateParams, KeyPair};
+use rcgen::{
+    BasicConstraints, Certificate, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
+    KeyUsagePurpose,
+};
 use std::collections::HashMap;
 use std::fs;
 use std::fs::OpenOptions;
@@ -40,16 +43,77 @@ fn acquire_e2e_lock() -> fs::File {
     file
 }
 
-fn write_test_cert() -> Result<(PathBuf, PathBuf)> {
-    let params = CertificateParams::new(vec!["localhost".to_string(), "127.0.0.1".to_string()])?;
+fn write_cert(path: &PathBuf, cert_pem: &str) -> Result<()> {
+    fs::write(path, cert_pem)?;
+    Ok(())
+}
+
+fn write_key(path: &PathBuf, key_pem: &str) -> Result<()> {
+    fs::write(path, key_pem)?;
+    Ok(())
+}
+
+fn build_ca() -> Result<(Certificate, KeyPair)> {
+    let mut params = CertificateParams::new(Vec::new())?;
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    params.key_usages = vec![
+        KeyUsagePurpose::KeyCertSign,
+        KeyUsagePurpose::DigitalSignature,
+    ];
     let key_pair = KeyPair::generate()?;
     let cert = params.self_signed(&key_pair)?;
+    Ok((cert, key_pair))
+}
 
-    let cert_path = temp_path("quichole_cert", "pem");
-    let key_path = temp_path("quichole_key", "key");
-    fs::write(&cert_path, cert.pem())?;
-    fs::write(&key_path, key_pair.serialize_pem())?;
-    Ok((cert_path, key_path))
+fn build_signed_cert(
+    subject_alt_names: Vec<String>,
+    usages: Vec<ExtendedKeyUsagePurpose>,
+    ca: &Certificate,
+    ca_key: &KeyPair,
+) -> Result<(Certificate, KeyPair)> {
+    let mut params = CertificateParams::new(subject_alt_names)?;
+    params.is_ca = IsCa::NoCa;
+    params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    params.extended_key_usages = usages;
+    let key_pair = KeyPair::generate()?;
+    let cert = params.signed_by(&key_pair, ca, ca_key)?;
+    Ok((cert, key_pair))
+}
+
+fn write_mtls_certs() -> Result<(PathBuf, PathBuf, PathBuf, PathBuf, PathBuf)> {
+    let (ca_cert, ca_key) = build_ca()?;
+    let (server_cert, server_key) = build_signed_cert(
+        vec!["localhost".to_string()],
+        vec![ExtendedKeyUsagePurpose::ServerAuth],
+        &ca_cert,
+        &ca_key,
+    )?;
+    let (client_cert, client_key) = build_signed_cert(
+        vec!["client".to_string()],
+        vec![ExtendedKeyUsagePurpose::ClientAuth],
+        &ca_cert,
+        &ca_key,
+    )?;
+
+    let ca_path = temp_path("quichole_ca", "pem");
+    let server_cert_path = temp_path("quichole_server", "pem");
+    let server_key_path = temp_path("quichole_server", "key");
+    let client_cert_path = temp_path("quichole_client", "pem");
+    let client_key_path = temp_path("quichole_client", "key");
+
+    write_cert(&ca_path, &ca_cert.pem())?;
+    write_cert(&server_cert_path, &server_cert.pem())?;
+    write_key(&server_key_path, &server_key.serialize_pem())?;
+    write_cert(&client_cert_path, &client_cert.pem())?;
+    write_key(&client_key_path, &client_key.serialize_pem())?;
+
+    Ok((
+        ca_path,
+        server_cert_path,
+        server_key_path,
+        client_cert_path,
+        client_key_path,
+    ))
 }
 
 fn unused_udp_port() -> u16 {
@@ -85,9 +149,13 @@ async fn run_echo_server(listener: TcpListener) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_quic_tcp_forward_end_to_end() -> Result<()> {
+async fn test_quic_tcp_forward_mtls_end_to_end() -> Result<()> {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .try_init();
     let _lock = acquire_e2e_lock();
-    let (cert_path, key_path) = write_test_cert()?;
+    let (ca_path, server_cert_path, server_key_path, client_cert_path, client_key_path) =
+        write_mtls_certs()?;
     let quic_port = unused_udp_port();
     let service_port = unused_tcp_port();
 
@@ -100,8 +168,10 @@ async fn test_quic_tcp_forward_end_to_end() -> Result<()> {
         heartbeat_interval: 30,
         default_token: Some("e2e_secret".to_string()),
         tls: TlsConfig {
-            cert: Some(cert_path.to_string_lossy().to_string()),
-            key: Some(key_path.to_string_lossy().to_string()),
+            cert: Some(server_cert_path.to_string_lossy().to_string()),
+            key: Some(server_key_path.to_string_lossy().to_string()),
+            ca: Some(ca_path.to_string_lossy().to_string()),
+            require_client_cert: true,
             ..TlsConfig::default()
         },
         services: HashMap::from([(
@@ -121,6 +191,10 @@ async fn test_quic_tcp_forward_end_to_end() -> Result<()> {
         default_token: Some("e2e_secret".to_string()),
         tls: TlsConfig {
             server_name: Some("localhost".to_string()),
+            ca: Some(ca_path.to_string_lossy().to_string()),
+            verify_peer: true,
+            cert: Some(client_cert_path.to_string_lossy().to_string()),
+            key: Some(client_key_path.to_string_lossy().to_string()),
             ..TlsConfig::default()
         },
         services: HashMap::from([(
@@ -141,7 +215,7 @@ async fn test_quic_tcp_forward_end_to_end() -> Result<()> {
     let client_handle = tokio::spawn(async move { run_client(client_state).await });
 
     let service_addr = format!("127.0.0.1:{service_port}");
-    let payload = b"quichole-e2e";
+    let payload = b"quichole-mtls-e2e";
 
     let result = timeout(Duration::from_secs(30), async {
         let mut stream = loop {
@@ -169,8 +243,11 @@ async fn test_quic_tcp_forward_end_to_end() -> Result<()> {
     let _ = client_handle.await;
     let _ = echo_handle.await;
 
-    let _ = fs::remove_file(&cert_path);
-    let _ = fs::remove_file(&key_path);
+    let _ = fs::remove_file(&ca_path);
+    let _ = fs::remove_file(&server_cert_path);
+    let _ = fs::remove_file(&server_key_path);
+    let _ = fs::remove_file(&client_cert_path);
+    let _ = fs::remove_file(&client_key_path);
 
     Ok(())
 }

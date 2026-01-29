@@ -1,4 +1,6 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
+use boring::ssl::{SslContextBuilder, SslFiletype, SslMethod, SslVerifyMode};
+use boring::x509::X509;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use quichole_shr::config::{ServiceType, TlsConfig};
@@ -15,7 +17,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, oneshot};
 use tokio_quiche::metrics::{DefaultMetrics, Metrics};
-use tokio_quiche::quic::SimpleConnectionIdGenerator;
+use tokio_quiche::quic::{ConnectionHook, SimpleConnectionIdGenerator};
 use tokio_quiche::settings::{CertificateKind, Hooks, QuicSettings, TlsCertificatePaths};
 use tokio_quiche::{listen, ConnectionParams};
 
@@ -61,11 +63,21 @@ fn build_server_params(tls: &TlsConfig) -> Result<ConnectionParams<'_>> {
     let cert = tls
         .cert
         .as_deref()
+        .filter(|val| !val.is_empty())
         .ok_or_else(|| anyhow!("tls.cert is required for server"))?;
     let key = tls
         .key
         .as_deref()
+        .filter(|val| !val.is_empty())
         .ok_or_else(|| anyhow!("tls.key is required for server"))?;
+    let ca = tls
+        .ca
+        .as_deref()
+        .filter(|val| !val.is_empty())
+        .map(str::to_string);
+    if tls.require_client_cert && ca.is_none() {
+        bail!("tls.ca is required when require_client_cert = true");
+    }
 
     let tls_paths = TlsCertificatePaths {
         cert,
@@ -73,8 +85,67 @@ fn build_server_params(tls: &TlsConfig) -> Result<ConnectionParams<'_>> {
         kind: CertificateKind::X509,
     };
     let settings = QuicSettings::default();
-    let hooks = Hooks::default();
+    let hooks = build_server_hooks(ca, tls.require_client_cert)?;
     Ok(ConnectionParams::new_server(settings, tls_paths, hooks))
+}
+
+struct ServerTlsHook {
+    ca: Option<String>,
+    require_client_cert: bool,
+}
+
+impl ConnectionHook for ServerTlsHook {
+    fn create_custom_ssl_context_builder(
+        &self,
+        settings: TlsCertificatePaths<'_>,
+    ) -> Option<SslContextBuilder> {
+        if settings.kind != CertificateKind::X509 {
+            return None;
+        }
+        let mut builder = SslContextBuilder::new(SslMethod::tls()).ok()?;
+        if let Err(err) = builder.set_certificate_chain_file(settings.cert) {
+            tracing::warn!(error = %err, "failed to load server certificate");
+            return None;
+        }
+        if let Err(err) = builder.set_private_key_file(settings.private_key, SslFiletype::PEM) {
+            tracing::warn!(error = %err, "failed to load server private key");
+            return None;
+        }
+        if let Err(err) = builder.check_private_key() {
+            tracing::warn!(error = %err, "server private key mismatch");
+            return None;
+        }
+        if let Some(ca) = &self.ca {
+            if let Err(err) = builder.set_ca_file(ca) {
+                tracing::warn!(error = %err, "failed to load server CA file");
+                return None;
+            }
+            if let Ok(pem) = std::fs::read(ca) {
+                if let Ok(certs) = X509::stack_from_pem(&pem) {
+                    for cert in certs {
+                        let _ = builder.add_client_ca(&cert);
+                    }
+                }
+            }
+        }
+        if self.require_client_cert {
+            builder.set_verify(SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT);
+        }
+        Some(builder)
+    }
+}
+
+fn build_server_hooks(ca: Option<String>, require_client_cert: bool) -> Result<Hooks> {
+    if ca.is_none() && !require_client_cert {
+        return Ok(Hooks::default());
+    }
+    let hook = ServerTlsHook {
+        ca,
+        require_client_cert,
+    };
+    Ok(Hooks {
+        connection_hook: Some(Arc::new(hook)),
+    })
 }
 
 struct ControlRequest {
@@ -95,6 +166,7 @@ where
 {
     let (app, handle) = QuicApp::new(quichole_shr::quic::CONTROL_STREAM_ID);
     let _conn = conn.start(app);
+    tracing::debug!("quic connection started");
 
     let (mut control_stream, manager) = handle.split();
     let mut control_decoder = FrameDecoder::new();
@@ -111,6 +183,7 @@ where
     let session = match handshake.verify_auth(&auth) {
         Ok(session) => {
             send_framed(&control_stream, &Ack::Ok).await?;
+            tracing::debug!("control handshake completed");
             session
         }
         Err(err) => {
@@ -143,6 +216,7 @@ async fn control_task(
     mut req_rx: mpsc::Receiver<ControlRequest>,
 ) -> Result<()> {
     while let Some(request) = req_rx.recv().await {
+        tracing::debug!("requesting data channel");
         let (cmd, session_key) = session.create_data_channel();
         send_framed(&control_stream, &cmd).await?;
         send_framed(&control_stream, &session_key).await?;
@@ -151,10 +225,19 @@ async fn control_task(
             .accept_stream()
             .await
             .ok_or_else(|| anyhow!("data stream closed"))?;
+        let stream_id = data_stream.id();
+        tracing::debug!(stream_id, "data stream accepted");
         let mut data_decoder = FrameDecoder::new();
-        let hello: Hello = recv_framed(&mut data_stream, &mut data_decoder).await?;
+        let hello: Hello = match recv_framed(&mut data_stream, &mut data_decoder).await {
+            Ok(hello) => hello,
+            Err(err) => {
+                tracing::warn!(error = %err, stream_id, "data channel hello failed");
+                return Err(err);
+            }
+        };
         let data_cmd = session.accept_data_channel_hello(&hello)?;
         send_framed(&data_stream, &data_cmd).await?;
+        tracing::debug!(mode = ?data_cmd, "data channel ready");
 
         let _ = request.response.send(Ok(PreparedDataStream {
             stream: data_stream,
@@ -187,6 +270,7 @@ async fn handle_tcp_connection(
     peer: SocketAddr,
     req_tx: mpsc::Sender<ControlRequest>,
 ) -> Result<()> {
+    tracing::debug!(peer = %peer, "tcp visitor connected");
     let prepared = request_data_stream(req_tx).await?;
     match prepared.mode {
         DataChannelCmd::StartForwardTcp => forward_tcp(socket, prepared.stream, peer).await,
@@ -272,6 +356,8 @@ async fn request_data_stream(req_tx: mpsc::Sender<ControlRequest>) -> Result<Pre
 }
 
 async fn forward_tcp(socket: TcpStream, stream: QuicStreamHandle, peer: SocketAddr) -> Result<()> {
+    let stream_id = stream.id();
+    tracing::debug!(peer = %peer, stream_id, "tcp forwarding started");
     let (quic_tx, mut quic_rx) = stream.split();
     let (mut reader, mut writer) = socket.into_split();
 
@@ -279,11 +365,13 @@ async fn forward_tcp(socket: TcpStream, stream: QuicStreamHandle, peer: SocketAd
         let mut buf = [0u8; 16 * 1024];
         loop {
             let n = reader.read(&mut buf).await?;
+            tracing::debug!(peer = %peer, stream_id, bytes = n, "tcp->quic read");
             if n == 0 {
                 quic_tx.send_fin().await?;
                 break;
             }
             quic_tx.send(Bytes::copy_from_slice(&buf[..n])).await?;
+            tracing::debug!(peer = %peer, stream_id, bytes = n, "tcp->quic sent");
         }
         Result::<()>::Ok(())
     };
@@ -291,9 +379,16 @@ async fn forward_tcp(socket: TcpStream, stream: QuicStreamHandle, peer: SocketAd
     let from_quic = async {
         while let Some(chunk) = quic_rx.recv().await {
             if !chunk.data.is_empty() {
+                tracing::debug!(
+                    peer = %peer,
+                    stream_id,
+                    bytes = chunk.data.len(),
+                    "quic->tcp recv"
+                );
                 writer.write_all(&chunk.data).await?;
             }
             if chunk.fin {
+                tracing::debug!(peer = %peer, stream_id, "quic->tcp fin");
                 writer.shutdown().await?;
                 break;
             }
@@ -333,5 +428,23 @@ where
             }
             return Err(anyhow!("quic stream finished before message complete"));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_server_params_requires_ca_for_mtls() {
+        let tls = TlsConfig {
+            cert: Some("server.pem".to_string()),
+            key: Some("server.key".to_string()),
+            require_client_cert: true,
+            ..TlsConfig::default()
+        };
+
+        let err = build_server_params(&tls).unwrap_err();
+        assert!(err.to_string().contains("tls.ca is required"));
     }
 }

@@ -15,8 +15,8 @@ heartbeat_interval = 30
 [tls]
 cert = "certs/server.pem"
 key = "certs/server.key"
-# ca = "certs/ca.pem"
-# require_client_cert = false
+# ca = "certs/ca.pem"          # 启用 mTLS 时填写
+# require_client_cert = false  # 启用 mTLS 时设为 true
 
 [services.ssh]
 bind_addr = "0.0.0.0:2222"
@@ -34,11 +34,11 @@ type = "udp"
 - `bind_addr`：服务端 QUIC 监听地址
 - `heartbeat_interval`：心跳间隔（秒，默认 30）
 - `default_token`：服务级 token 的默认值（可选）
-- `tls`：TLS 配置（当前仅使用 `cert`/`key`）
+- `tls`：TLS 配置（支持私有 CA / mTLS）
   - `cert`：服务端证书路径（PEM）
   - `key`：服务端私钥路径（PEM）
-  - `ca`：CA 证书路径（预留）
-  - `require_client_cert`：是否要求客户端证书（预留）
+  - `ca`：CA 证书路径（用于校验客户端证书；`require_client_cert = true` 时必填）
+  - `require_client_cert`：是否要求客户端证书（mTLS）
 - `services`：服务列表（至少一个）
   - `bind_addr`：服务暴露地址
   - `token`：服务 token（可为空，若 `default_token` 已配置会自动填充）
@@ -55,10 +55,10 @@ retry_interval = 1
 
 [tls]
 server_name = "example.com"
-# ca = "certs/ca.pem"
-# verify_peer = false
-# cert = "certs/client.pem"
-# key = "certs/client.key"
+# ca = "certs/ca.pem"       # 私有 CA / mTLS
+# verify_peer = true        # 启用服务端证书校验
+# cert = "certs/client.pem" # mTLS 客户端证书
+# key = "certs/client.key"  # mTLS 客户端私钥
 
 [services.ssh]
 local_addr = "127.0.0.1:22"
@@ -79,11 +79,11 @@ retry_interval = 5
 - `heartbeat_timeout`：心跳超时（秒，默认 40）
 - `retry_interval`：重试间隔（秒，默认 1）
 - `default_token`：服务级 token 的默认值（可选）
-- `tls`：TLS 配置（当前仅使用 `server_name`）
+- `tls`：TLS 配置（支持私有 CA / mTLS）
   - `server_name`：SNI 名称（可选，默认从 `remote_addr` 提取）
-  - `ca`：CA 证书路径（预留）
-  - `verify_peer`：是否校验服务端证书（预留）
-  - `cert` / `key`：客户端证书与私钥（预留）
+  - `ca`：CA 证书路径（私有 CA；配置后需同时提供 `cert`/`key`）
+  - `verify_peer`：是否校验服务端证书（true 时启用；未配置 `ca` 则使用系统 CA）
+  - `cert` / `key`：客户端证书与私钥（mTLS）
 - `services`：服务列表（至少一个）
   - `local_addr`：本地服务地址
   - `token`：服务 token（可为空，若 `default_token` 已配置会自动填充）
@@ -102,6 +102,8 @@ retry_interval = 5
 - `services` 必须至少包含一个服务
 - 服务 token 为空时会尝试用 `default_token` 填充；若仍为空则报错
 - TLS 证书为运行时依赖：服务端需要提供 `tls.cert` + `tls.key`
+- 当 `tls.require_client_cert = true` 时，服务端还需要 `tls.ca`
+- 客户端启用私有 CA / mTLS（配置 `tls.ca`）时，需要提供 `tls.cert` + `tls.key`
 
 ## CLI 使用
 

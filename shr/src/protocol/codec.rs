@@ -81,6 +81,10 @@ impl FrameDecoder {
         self.buffer.extend_from_slice(data);
     }
 
+    pub fn take_remaining(&mut self) -> BytesMut {
+        std::mem::take(&mut self.buffer)
+    }
+
     pub fn decode_next<T>(&mut self) -> Option<Result<T>>
     where
         T: for<'de> Deserialize<'de>,

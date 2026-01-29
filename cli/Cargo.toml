@@ -18,3 +18,4 @@ bytes.workspace = true
 tokio-quiche.workspace = true
 futures-util.workspace = true
 serde.workspace = true
+boring.workspace = true

@@ -217,6 +217,7 @@ impl QuicApp {
             },
         );
 
+        tracing::debug!(stream_id, "quic stream created");
         handle
     }
 
@@ -288,7 +289,10 @@ impl QuicApp {
                         state.pending.push_front(chunk);
                         break;
                     }
-                    Err(err) => return Err(Box::new(err)),
+                    Err(err) => {
+                        tracing::warn!(stream_id, error = ?err, "quic stream send failed");
+                        return Err(Box::new(err));
+                    }
                 }
             }
         }
@@ -333,6 +337,7 @@ impl ApplicationOverQuic for QuicApp {
             loop {
                 match qconn.stream_recv(stream_id, &mut self.buffer) {
                     Ok((read, fin)) => {
+                        tracing::debug!(stream_id, bytes = read, fin, "quic stream recv");
                         let chunk = StreamChunk {
                             data: Bytes::copy_from_slice(&self.buffer[..read]),
                             fin,

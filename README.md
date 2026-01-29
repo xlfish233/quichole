@@ -76,6 +76,8 @@ bind_addr = "0.0.0.0:4433"
 [tls]
 cert = "certs/server.pem"
 key = "certs/server.key"
+# ca = "certs/ca.pem"
+# require_client_cert = true
 
 [services.my_ssh]
 token = "your_secret_token"
@@ -108,6 +110,10 @@ remote_addr = "your-server.com:4433"
 
 [tls]
 server_name = "your-server.com"
+# ca = "certs/ca.pem"
+# verify_peer = true
+# cert = "certs/client.pem"
+# key = "certs/client.key"
 
 [services.my_ssh]
 token = "your_secret_token"
@@ -121,6 +127,8 @@ quichole-client -c client.toml
 ```
 
 现在你可以通过 `your-server.com:2222` 访问内网的 SSH 服务了！
+
+> 若需私有 CA / mTLS：服务端配置 `tls.ca` + `require_client_cert = true`，客户端配置 `tls.ca` + `tls.cert` + `tls.key` 并设置 `tls.verify_peer = true`。
 
 ## 与 rathole 的对比
 
@@ -143,7 +151,8 @@ quichole-client -c client.toml
 - [x] 配置文件支持（Phase 2.1/2.2）
 - [x] 服务端实现（MVP 传输/转发）
 - [x] 客户端实现（MVP 传输/转发）
-- [ ] 集成测试与端到端测试
+- [x] 端到端测试（QUIC TCP + mTLS）
+- [ ] 更丰富的集成测试
 - [ ] 文档完善（持续更新）
 
 ## 许可证

@@ -18,7 +18,9 @@ bytes.workspace = true
 tokio-quiche.workspace = true
 futures-util.workspace = true
 serde.workspace = true
+boring.workspace = true
 
 [dev-dependencies]
 quichole-cli = { path = "../cli" }
 rcgen = "0.13"
+fs2 = "0.4"

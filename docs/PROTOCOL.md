@@ -226,6 +226,10 @@ pub struct UdpTraffic {
 4. 客户端通过新流发送 `DataChannelHello`
 5. 服务端验证 session_key 并发送 `StartForwardTcp` 或 `StartForwardUdp`
 
+> 注意：`DataChannelCmd` 与后续业务数据可能在同一 QUIC 流中连续发送，
+> 甚至被合并在同一个 QUIC 包里；实现方必须在解码命令后保留剩余字节，
+> 并继续按对应的转发协议处理，避免丢包。
+
 ## 数据通道协议
 
 数据通道使用 QUIC Stream 4, 8, 12, ... （客户端发起的双向流）进行通信。

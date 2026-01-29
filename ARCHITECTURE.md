@@ -61,7 +61,7 @@ quichole/
   - `ControlChannelCmd`: 控制通道命令（创建数据通道/心跳）
   - `DataChannelCmd`: 数据通道命令（开始转发 TCP/UDP）
   - `UdpTraffic`: UDP 流量封装
-- **Codec**: 长度前缀 + bincode 编解码
+- **Codec**: 长度前缀 + bincode 编解码，支持流式解码与剩余字节保留，避免数据通道命令与首包数据共帧导致丢包
 - **Digest**: 服务摘要、nonce、session_key、认证摘要
 
 #### Config 模块
@@ -70,7 +70,7 @@ quichole/
 
 #### Crypto 模块
 - Token 认证摘要计算与校验（常量时间对比）
-- TLS 配置结构（用于后续私有 CA / mTLS）
+- TLS 配置结构（已支持私有 CA / mTLS）
 
 ### 2. 服务端 (svr)
 
