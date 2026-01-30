@@ -213,7 +213,7 @@ pub struct UdpTraffic {
 
 - 服务端每隔 `heartbeat_interval` 秒发送 `Heartbeat` 命令
 - 客户端收到心跳后回发 `Heartbeat` 作为 ACK
-- 服务端若在 `heartbeat_interval * 3` 内未收到 ACK，视为连接断开
+- 服务端若在 `heartbeat_ack_timeout` 内未收到 ACK，视为连接断开（默认 `heartbeat_interval * 3`）
 - 客户端在 `heartbeat_timeout` 秒内未收到心跳，认为连接断开并重连
 - 控制通道断开后，服务端应停止对应服务监听，避免端口占用影响重连
 

@@ -212,10 +212,22 @@ where
     let service = session.service().clone();
     let (req_tx, req_rx) = mpsc::channel(64);
     let heartbeat_interval = server.config().heartbeat_interval;
+    let heartbeat_ack_timeout = server
+        .config()
+        .heartbeat_ack_timeout
+        .unwrap_or_else(|| heartbeat_interval.saturating_mul(3).max(3));
 
     tokio::spawn(async move {
         if let Err(err) =
-            control_task(session, control_stream, manager, req_rx, heartbeat_interval).await
+            control_task(
+                session,
+                control_stream,
+                manager,
+                req_rx,
+                heartbeat_interval,
+                heartbeat_ack_timeout,
+            )
+            .await
         {
             tracing::warn!(error = %err, "control task failed");
         }
@@ -235,10 +247,11 @@ async fn control_task(
     mut manager: QuicStreamManager,
     mut req_rx: mpsc::Receiver<ControlRequest>,
     heartbeat_interval: u64,
+    heartbeat_ack_timeout: u64,
 ) -> Result<()> {
     let mut ticker = interval(Duration::from_secs(heartbeat_interval));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let heartbeat_timeout = Duration::from_secs(heartbeat_interval.saturating_mul(3).max(3));
+    let heartbeat_timeout = Duration::from_secs(heartbeat_ack_timeout.max(1));
     let mut last_heartbeat = Instant::now();
     let mut control_decoder = FrameDecoder::new();
 

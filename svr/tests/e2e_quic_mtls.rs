@@ -166,6 +166,7 @@ async fn test_quic_tcp_forward_mtls_end_to_end() -> Result<()> {
     let server_config = ServerConfig {
         bind_addr: format!("127.0.0.1:{quic_port}"),
         heartbeat_interval: 30,
+        heartbeat_ack_timeout: None,
         default_token: Some("e2e_secret".to_string()),
         tls: TlsConfig {
             cert: Some(server_cert_path.to_string_lossy().to_string()),

@@ -9,6 +9,8 @@
 ```toml
 bind_addr = "0.0.0.0:4433"
 heartbeat_interval = 30
+# 可选：心跳 ACK 超时，默认 heartbeat_interval * 3
+# heartbeat_ack_timeout = 90
 # 可选：为未填写 token 的服务提供默认值
 # default_token = "default_secret"
 
@@ -33,6 +35,7 @@ type = "udp"
 
 - `bind_addr`：服务端 QUIC 监听地址
 - `heartbeat_interval`：心跳间隔（秒，默认 30）
+- `heartbeat_ack_timeout`：心跳 ACK 超时（秒，默认 `heartbeat_interval * 3`）
 - `default_token`：服务级 token 的默认值（可选）
 - `tls`：TLS 配置（支持私有 CA / mTLS）
   - `cert`：服务端证书路径（PEM）
@@ -97,7 +100,7 @@ retry_interval = 5
   - 客户端：`remote_addr`
   - 每个服务：`bind_addr` / `local_addr`
 - 数值必须大于 0：
-  - `heartbeat_interval` / `heartbeat_timeout`
+  - `heartbeat_interval` / `heartbeat_ack_timeout` / `heartbeat_timeout`
   - `retry_interval`（全局与服务级）
 - `services` 必须至少包含一个服务
 - 服务 token 为空时会尝试用 `default_token` 填充；若仍为空则报错

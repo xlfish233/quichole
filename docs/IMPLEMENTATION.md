@@ -661,6 +661,8 @@ pub struct ServerConfig {
     #[serde(default = "default_heartbeat_interval")]
     pub heartbeat_interval: u64,
     #[serde(default)]
+    pub heartbeat_ack_timeout: Option<u64>,
+    #[serde(default)]
     pub default_token: Option<String>,
     pub services: HashMap<String, ServerServiceConfig>,
 }
@@ -793,6 +795,11 @@ impl ServerConfig {
         }
         if self.heartbeat_interval == 0 {
             bail!("server heartbeat_interval must be > 0");
+        }
+        if let Some(ack_timeout) = self.heartbeat_ack_timeout {
+            if ack_timeout == 0 {
+                bail!("server heartbeat_ack_timeout must be > 0");
+            }
         }
         if self.services.is_empty() {
             bail!("server services is empty");

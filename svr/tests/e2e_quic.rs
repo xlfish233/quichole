@@ -173,7 +173,6 @@ async fn wait_for_port_close(addr: &str, timeout_secs: u64) -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_quic_tcp_forward_end_to_end() -> Result<()> {
     let _lock = acquire_e2e_lock();
-    eprintln!("e2e_quic: start test_quic_tcp_forward_end_to_end");
     let (cert_path, key_path) = write_test_cert()?;
     let quic_port = unused_udp_port();
     let service_port = unused_tcp_port();
@@ -185,6 +184,7 @@ async fn test_quic_tcp_forward_end_to_end() -> Result<()> {
     let server_config = ServerConfig {
         bind_addr: format!("127.0.0.1:{quic_port}"),
         heartbeat_interval: 30,
+        heartbeat_ack_timeout: None,
         default_token: Some("e2e_secret".to_string()),
         tls: TlsConfig {
             cert: Some(cert_path.to_string_lossy().to_string()),
@@ -226,7 +226,6 @@ async fn test_quic_tcp_forward_end_to_end() -> Result<()> {
 
     let server_handle = tokio::spawn(async move { run_server(server_state).await });
     let client_handle = tokio::spawn(async move { run_client(client_state).await });
-    eprintln!("e2e_quic: server/client spawned");
 
     let service_addr = format!("127.0.0.1:{service_port}");
     let payload = b"quichole-e2e";
@@ -247,7 +246,6 @@ async fn test_quic_tcp_forward_end_to_end() -> Result<()> {
         Ok::<Vec<u8>, anyhow::Error>(buf)
     })
     .await??;
-    eprintln!("e2e_quic: received echo response");
 
     assert_eq!(result.as_slice(), payload);
 
@@ -257,7 +255,6 @@ async fn test_quic_tcp_forward_end_to_end() -> Result<()> {
     let _ = server_handle.await;
     let _ = client_handle.await;
     let _ = echo_handle.await;
-    eprintln!("e2e_quic: test_quic_tcp_forward_end_to_end finished");
 
     let _ = fs::remove_file(&cert_path);
     let _ = fs::remove_file(&key_path);
@@ -280,6 +277,7 @@ async fn test_service_stops_after_control_channel_close() -> Result<()> {
     let server_config = ServerConfig {
         bind_addr: format!("127.0.0.1:{quic_port}"),
         heartbeat_interval: 1,
+        heartbeat_ack_timeout: None,
         default_token: Some("e2e_secret".to_string()),
         tls: TlsConfig {
             cert: Some(cert_path.to_string_lossy().to_string()),
@@ -378,6 +376,7 @@ async fn test_service_rebinds_after_client_reconnect() -> Result<()> {
     let server_config = ServerConfig {
         bind_addr: format!("127.0.0.1:{quic_port}"),
         heartbeat_interval: 1,
+        heartbeat_ack_timeout: None,
         default_token: Some("e2e_secret".to_string()),
         tls: TlsConfig {
             cert: Some(cert_path.to_string_lossy().to_string()),
@@ -502,6 +501,7 @@ async fn test_stream_id_monotonic_across_connections() -> Result<()> {
     let server_config = ServerConfig {
         bind_addr: format!("127.0.0.1:{quic_port}"),
         heartbeat_interval: 1,
+        heartbeat_ack_timeout: None,
         default_token: Some("e2e_secret".to_string()),
         tls: TlsConfig {
             cert: Some(cert_path.to_string_lossy().to_string()),

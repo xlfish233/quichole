@@ -15,6 +15,10 @@ pub struct ServerConfig {
     #[serde(default = "default_heartbeat_interval")]
     pub heartbeat_interval: u64,
 
+    /// 心跳 ACK 超时（秒，默认 heartbeat_interval * 3）
+    #[serde(default)]
+    pub heartbeat_ack_timeout: Option<u64>,
+
     /// 默认 token（可选）
     #[serde(default)]
     pub default_token: Option<String>,
@@ -53,6 +57,14 @@ impl ServerConfig {
         }
         if self.heartbeat_interval == 0 {
             bail!("server heartbeat_interval must be > 0");
+        }
+        if let Some(ack_timeout) = self.heartbeat_ack_timeout {
+            if ack_timeout == 0 {
+                bail!("server heartbeat_ack_timeout must be > 0");
+            }
+        } else {
+            let default_ack = self.heartbeat_interval.saturating_mul(3).max(3);
+            self.heartbeat_ack_timeout = Some(default_ack);
         }
         if self.services.is_empty() {
             bail!("server services is empty");
@@ -93,6 +105,7 @@ mod tests {
         let toml_str = r#"
             bind_addr = "0.0.0.0:4433"
             heartbeat_interval = 30
+            heartbeat_ack_timeout = 120
 
             [services.ssh]
             token = "secret_token"
@@ -104,6 +117,7 @@ mod tests {
 
         assert_eq!(config.bind_addr, "0.0.0.0:4433");
         assert_eq!(config.heartbeat_interval, 30);
+        assert_eq!(config.heartbeat_ack_timeout, Some(120));
         assert_eq!(config.services.len(), 1);
 
         let ssh_service = config.services.get("ssh").unwrap();
@@ -141,10 +155,12 @@ mod tests {
             bind_addr = "0.0.0.0:2222"
         "#;
 
-        let config: ServerConfig = toml::from_str(toml_str).unwrap();
+        let mut config: ServerConfig = toml::from_str(toml_str).unwrap();
+        config.validate().unwrap();
 
         // 默认心跳间隔应该是 30 秒
         assert_eq!(config.heartbeat_interval, 30);
+        assert_eq!(config.heartbeat_ack_timeout, Some(90));
     }
 
     #[test]
@@ -296,6 +312,23 @@ mod tests {
         let toml_str = r#"
             bind_addr = "0.0.0.0:4433"
             heartbeat_interval = 0
+
+            [services.ssh]
+            token = "token"
+            bind_addr = "0.0.0.0:2222"
+        "#;
+
+        let mut config: ServerConfig = toml::from_str(toml_str).unwrap();
+        let result = config.validate();
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_server_config_validation_zero_heartbeat_ack_timeout() {
+        let toml_str = r#"
+            bind_addr = "0.0.0.0:4433"
+            heartbeat_ack_timeout = 0
 
             [services.ssh]
             token = "token"

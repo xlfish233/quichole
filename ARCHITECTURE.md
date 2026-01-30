@@ -65,7 +65,7 @@ quichole/
 - **Digest**: 服务摘要、nonce、session_key、认证摘要
 
 #### Config 模块
-- 服务端配置: 监听地址、心跳间隔、默认 token、服务列表（bind_addr/type/token）
+- 服务端配置: 监听地址、心跳间隔、心跳 ACK 超时、默认 token、服务列表（bind_addr/type/token）
 - 客户端配置: 服务器地址、心跳超时、重试间隔、默认 token、服务列表（local_addr/type/token/retry_interval）
 
 #### Crypto 模块
@@ -282,7 +282,7 @@ pub struct UdpTraffic {
 
 - 服务端每隔 `heartbeat_interval` 秒发送 `Heartbeat` 命令
 - 客户端收到心跳后回发 `Heartbeat` 作为 ACK
-- 服务端若在 `heartbeat_interval * 3` 内未收到 ACK，认为连接断开
+- 服务端若在 `heartbeat_ack_timeout` 内未收到 ACK，认为连接断开（默认 `heartbeat_interval * 3`）
 - 客户端在 `heartbeat_timeout` 秒内未收到心跳，认为连接断开
 - 客户端将尝试重新连接
 - 控制通道关闭时，服务端停止对应服务监听，避免端口占用导致重连失败
