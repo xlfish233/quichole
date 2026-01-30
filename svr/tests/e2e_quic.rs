@@ -174,3 +174,114 @@ async fn test_quic_tcp_forward_end_to_end() -> Result<()> {
 
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_service_stops_after_control_channel_close() -> Result<()> {
+    let _lock = acquire_e2e_lock();
+    let (cert_path, key_path) = write_test_cert()?;
+    let quic_port = unused_udp_port();
+    let service_port = unused_tcp_port();
+
+    let local_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let local_addr = local_listener.local_addr()?;
+    let echo_handle = tokio::spawn(run_echo_server(local_listener));
+
+    let server_config = ServerConfig {
+        bind_addr: format!("127.0.0.1:{quic_port}"),
+        heartbeat_interval: 1,
+        default_token: Some("e2e_secret".to_string()),
+        tls: TlsConfig {
+            cert: Some(cert_path.to_string_lossy().to_string()),
+            key: Some(key_path.to_string_lossy().to_string()),
+            ..TlsConfig::default()
+        },
+        services: HashMap::from([(
+            "echo".to_string(),
+            ServerServiceConfig {
+                bind_addr: format!("127.0.0.1:{service_port}"),
+                token: String::new(),
+                service_type: ServiceType::Tcp,
+            },
+        )]),
+    };
+
+    let client_config = ClientConfig {
+        remote_addr: format!("127.0.0.1:{quic_port}"),
+        heartbeat_timeout: 5,
+        retry_interval: 1,
+        default_token: Some("e2e_secret".to_string()),
+        tls: TlsConfig {
+            server_name: Some("localhost".to_string()),
+            ..TlsConfig::default()
+        },
+        services: HashMap::from([(
+            "echo".to_string(),
+            ClientServiceConfig {
+                local_addr: local_addr.to_string(),
+                token: String::new(),
+                service_type: ServiceType::Tcp,
+                retry_interval: None,
+            },
+        )]),
+    };
+
+    let server_state = ServerState::from_config(server_config).context("build server state")?;
+    let client_state = ClientState::from_config(client_config).context("build client state")?;
+
+    let server_handle = tokio::spawn(async move { run_server(server_state).await });
+    let client_handle = tokio::spawn(async move { run_client(client_state).await });
+
+    let service_addr = format!("127.0.0.1:{service_port}");
+    let payload = b"quichole-stop";
+
+    let result = timeout(Duration::from_secs(20), async {
+        let mut stream = loop {
+            match TcpStream::connect(&service_addr).await {
+                Ok(stream) => break stream,
+                Err(_) => {
+                    sleep(Duration::from_millis(50)).await;
+                }
+            }
+        };
+
+        stream.write_all(payload).await?;
+        let mut buf = vec![0u8; payload.len()];
+        stream.read_exact(&mut buf).await?;
+        Ok::<Vec<u8>, anyhow::Error>(buf)
+    })
+    .await??;
+
+    assert_eq!(result.as_slice(), payload);
+
+    client_handle.abort();
+    let _ = client_handle.await;
+    sleep(Duration::from_secs(2)).await;
+
+    let stop_result = timeout(Duration::from_secs(5), async {
+        loop {
+            match timeout(Duration::from_millis(200), TcpStream::connect(&service_addr)).await {
+                Ok(Ok(_)) => {
+                    sleep(Duration::from_millis(100)).await;
+                }
+                Ok(Err(_)) => break,
+                Err(_) => continue,
+            }
+        }
+    })
+    .await;
+
+    assert!(
+        stop_result.is_ok(),
+        "service port still accepting connections after control channel close"
+    );
+
+    server_handle.abort();
+    echo_handle.abort();
+    let _ = server_handle.await;
+    let _ = echo_handle.await;
+
+    let _ = fs::remove_file(&cert_path);
+    let _ = fs::remove_file(&key_path);
+
+    Ok(())
+}
