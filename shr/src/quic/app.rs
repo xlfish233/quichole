@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, Notify};
 use tokio_quiche::quic::HandshakeInfo;
@@ -173,6 +173,7 @@ struct StreamState {
 
 pub struct QuicApp {
     streams: HashMap<u64, StreamState>,
+    seen_streams: HashSet<u64>,
     incoming_tx: mpsc::UnboundedSender<QuicStreamHandle>,
     cmd_rx: mpsc::Receiver<QuicAppCommand>,
     cmd_rx_closed_logged: bool,
@@ -188,6 +189,7 @@ impl QuicApp {
 
         let mut app = Self {
             streams: HashMap::new(),
+            seen_streams: HashSet::new(),
             incoming_tx,
             cmd_rx,
             cmd_rx_closed_logged: false,
@@ -206,6 +208,7 @@ impl QuicApp {
     }
 
     fn create_stream(&mut self, stream_id: u64) -> QuicStreamHandle {
+        self.seen_streams.insert(stream_id);
         let (outbound_tx, outbound_rx) = mpsc::channel(STREAM_CHANNEL_SIZE);
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
 
@@ -235,8 +238,8 @@ impl QuicApp {
                 stream_id,
                 response,
             } => {
-                if self.streams.contains_key(&stream_id) {
-                    let _ = response.send(Err(anyhow!("stream {} already exists", stream_id)));
+                if self.seen_streams.contains(&stream_id) {
+                    let _ = response.send(Err(anyhow!("stream {} already used", stream_id)));
                     return;
                 }
                 let handle = self.create_stream(stream_id);
@@ -357,6 +360,25 @@ impl ApplicationOverQuic for QuicApp {
         );
         
         for stream_id in readable_streams {
+            if self.seen_streams.contains(&stream_id) && !self.streams.contains_key(&stream_id) {
+                tracing::warn!(stream_id, "dropping data for reused stream id");
+                loop {
+                    match qconn.stream_recv(stream_id, &mut self.buffer) {
+                        Ok((_read, fin)) => {
+                            if fin {
+                                break;
+                            }
+                        }
+                        Err(quiche::Error::Done) => break,
+                        Err(err) => {
+                            tracing::error!(stream_id, error = ?err, "quic stream recv error");
+                            return Err(Box::new(err));
+                        }
+                    }
+                }
+                continue;
+            }
+
             if !self.streams.contains_key(&stream_id) {
                 tracing::debug!(stream_id, "creating new stream for incoming data");
                 let handle = self.create_stream(stream_id);
@@ -429,5 +451,33 @@ impl ApplicationOverQuic for QuicApp {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_rejects_reused_stream_id() {
+        let (mut app, _handle) = QuicApp::new(0);
+
+        let (tx, rx) = oneshot::channel();
+        app.handle_command(QuicAppCommand::OpenStream {
+            stream_id: 4,
+            response: tx,
+        });
+        let _ = rx.await.unwrap().unwrap();
+        app.streams.remove(&4);
+
+        let (tx, rx) = oneshot::channel();
+        app.handle_command(QuicAppCommand::OpenStream {
+            stream_id: 4,
+            response: tx,
+        });
+        let result = rx.await.unwrap();
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(err.to_string().contains("already used"));
     }
 }
