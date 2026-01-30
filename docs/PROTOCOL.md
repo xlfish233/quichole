@@ -184,6 +184,7 @@ pub struct UdpTraffic {
   |      控制通道建立成功                    |
   |                                         |
   |<-------- Heartbeat (定期) --------------|
+  |-------- Heartbeat ACK ----------------->|
   |                                         |
   |<---- CreateDataChannel (按需) ---------|
 ```

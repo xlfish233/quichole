@@ -1,12 +1,42 @@
 # Quichole 架构设计
 
-## 项目结构
+## 最新设计架构图
+
+```
+                 ┌──────────────────────────────────────────┐
+                 │                 公网服务端               │
+                 │  quichole-svr                            │
+                 │  - QUIC Listener (UDP)                   │
+                 │  - Control Channel (Stream 0)            │
+                 │  - Data Streams (4,8,12,...)             │
+                 │  - TCP/UDP Service Listeners             │
+                 └───────────────┬──────────────────────────┘
+                                 │ QUIC (TLS 1.3, mTLS 可选)
+                                 │  心跳 + ACK + 断线检测
+                 ┌───────────────┴──────────────────────────┐
+                 │                 内网客户端               │
+                 │  quichole-cli                            │
+                 │  - Control Channel (Stream 0)            │
+                 │  - Data Streams (4,8,12,...)             │
+                 │  - Local TCP/UDP Services                │
+                 └───────────────┬──────────────────────────┘
+                                 │
+                                 │  访问者 TCP/UDP
+                                 ▼
+                          访问者 -> 服务端暴露端口
+```
+
+## 项目结构（文件组织）
 
 ```
 quichole/
 ├── Cargo.toml          # Workspace 配置
 ├── README.md           # 项目说明
 ├── ARCHITECTURE.md     # 架构文档
+├── docs/               # 设计与配置文档
+│   ├── CONFIGURATION.md
+│   ├── PROTOCOL.md
+│   └── IMPLEMENTATION.md
 ├── shr/                # 共享库 (quichole-shr)
 │   ├── Cargo.toml
 │   └── src/
@@ -37,6 +67,10 @@ quichole/
 │       ├── service.rs        # 服务管理
 │       ├── handshake.rs      # 控制/数据通道握手
 │       └── runtime.rs        # tokio-quiche 运行时
+│   └── tests/
+│       ├── e2e_handshake.rs
+│       ├── e2e_quic.rs
+│       └── e2e_quic_mtls.rs
 └── cli/                # 客户端 (quichole-cli)
     ├── Cargo.toml
     └── src/
@@ -45,6 +79,7 @@ quichole/
         ├── service.rs        # 服务管理
         ├── handshake.rs      # 客户端握手
         └── runtime.rs        # tokio-quiche 运行时
+    └── tests/               # (预留) 客户端集成测试
 ```
 
 ## 核心组件
@@ -151,6 +186,37 @@ struct Client {
 - Stream 0: 控制流（双向）
 - Stream 4, 8, 12, ...: 客户端发起的数据流（双向）
 - 每个数据流对应一个访问者连接（TCP/UDP）
+
+## 通信时序图
+
+### 控制通道（握手 + 心跳）
+
+```
+客户端                                       服务端
+  |-- ControlChannelHello(v1, digest) ------>|
+  |<------------------- nonce ---------------|
+  |-- Auth(sha256(token+nonce)) ------------>|
+  |<----------------- Ack::Ok ---------------|
+  |<----- Heartbeat (interval) --------------|
+  |----- Heartbeat ACK --------------------->|
+  |<----- Heartbeat (interval) --------------|
+  |----- Heartbeat ACK --------------------->|
+  |  (若服务端在 heartbeat_ack_timeout 内未收到 ACK，判定断开)
+```
+
+### 数据通道（TCP 转发）
+
+```
+访问者                服务端                     客户端              本地服务
+  |-- TCP connect ---->|                         |                   |
+  |                    |-- CreateDataChannel --->|                   |
+  |                    |-- session_key --------->|                   |
+  |                    |<-- 新 QUIC 流 (id=4) ---|                   |
+  |                    |<-- DataChannelHello ----|                   |
+  |                    |-- StartForwardTcp ----->|                   |
+  |                    |                         |-- connect ------->|
+  |<====== TCP ======>|<==== QUIC stream =======>|<==== TCP =======>|
+```
 
 ## 参考 rathole 的设计
 
