@@ -25,6 +25,13 @@
     +--> 本地服务          |                    |
 ```
 
+## 文档导航
+
+- 架构与时序图：`ARCHITECTURE.md`
+- 协议说明：`docs/PROTOCOL.md`
+- 配置说明：`docs/CONFIGURATION.md`
+- 实施/阶段说明：`docs/IMPLEMENTATION.md`
+
 ## 快速开始
 
 ### 构建依赖
