@@ -45,8 +45,11 @@ pub async fn run_client_with_shutdown(
         let retry = service
             .retry_interval()
             .unwrap_or(client.config().retry_interval);
+        let quic_idle_timeout_ms = client.config().quic_idle_timeout_ms;
         join_set.spawn(async move {
-            if let Err(err) = run_service(remote_addr, tls, service, retry).await {
+            if let Err(err) =
+                run_service(remote_addr, tls, service, retry, quic_idle_timeout_ms).await
+            {
                 tracing::warn!(error = %err, "client service stopped");
             }
         });
@@ -69,9 +72,10 @@ async fn run_service(
     tls: TlsConfig,
     service: ClientService,
     retry_interval: u64,
+    quic_idle_timeout_ms: Option<u64>,
 ) -> Result<()> {
     loop {
-        match run_service_once(&remote_addr, &tls, &service).await {
+        match run_service_once(&remote_addr, &tls, &service, quic_idle_timeout_ms).await {
             Ok(()) => return Ok(()),
             Err(err) => {
                 tracing::warn!(
@@ -90,6 +94,7 @@ async fn run_service_once(
     remote_addr: &str,
     tls: &TlsConfig,
     service: &ClientService,
+    quic_idle_timeout_ms: Option<u64>,
 ) -> Result<()> {
     validate_client_tls_config(tls)?;
     let remote = resolve_remote_addr(remote_addr).await?;
@@ -114,10 +119,7 @@ async fn run_service_once(
         _ => None,
     };
     let mut settings = QuicSettings::default();
-    if let Some(timeout_ms) = std::env::var("QUIC_IDLE_TIMEOUT_MS")
-        .ok()
-        .and_then(|val| val.parse::<u64>().ok())
-    {
+    if let Some(timeout_ms) = quic_idle_timeout_ms {
         settings.max_idle_timeout = Some(StdDuration::from_millis(timeout_ms));
     }
     settings.verify_peer = tls.verify_peer;

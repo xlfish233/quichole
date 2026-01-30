@@ -4,6 +4,12 @@
 
 > 当前实现使用**顶层字段**格式，不包含 `[server]` / `[client]` 外层表。
 
+## 文档导航
+
+- 架构与时序图：`ARCHITECTURE.md`
+- 协议说明：`docs/PROTOCOL.md`
+- 实施/阶段说明：`docs/IMPLEMENTATION.md`
+
 ## 服务端配置（server.toml）
 
 ```toml

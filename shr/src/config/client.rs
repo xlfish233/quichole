@@ -19,6 +19,10 @@ pub struct ClientConfig {
     #[serde(default = "default_retry_interval")]
     pub retry_interval: u64,
 
+    /// QUIC 空闲超时（毫秒，可选）
+    #[serde(default)]
+    pub quic_idle_timeout_ms: Option<u64>,
+
     /// 默认 token（可选）
     #[serde(default)]
     pub default_token: Option<String>,
@@ -69,6 +73,11 @@ impl ClientConfig {
         if self.retry_interval == 0 {
             bail!("client retry_interval must be > 0");
         }
+        if let Some(idle_timeout) = self.quic_idle_timeout_ms {
+            if idle_timeout == 0 {
+                bail!("client quic_idle_timeout_ms must be > 0");
+            }
+        }
         if self.services.is_empty() {
             bail!("client services is empty");
         }
@@ -114,6 +123,7 @@ mod tests {
             remote_addr = "example.com:4433"
             heartbeat_timeout = 40
             retry_interval = 1
+            quic_idle_timeout_ms = 5000
 
             [services.ssh]
             token = "secret_token"
@@ -126,6 +136,7 @@ mod tests {
         assert_eq!(config.remote_addr, "example.com:4433");
         assert_eq!(config.heartbeat_timeout, 40);
         assert_eq!(config.retry_interval, 1);
+        assert_eq!(config.quic_idle_timeout_ms, Some(5000));
         assert_eq!(config.services.len(), 1);
 
         let ssh_service = config.services.get("ssh").unwrap();
@@ -168,6 +179,7 @@ mod tests {
         // 默认值
         assert_eq!(config.heartbeat_timeout, 40);
         assert_eq!(config.retry_interval, 1);
+        assert_eq!(config.quic_idle_timeout_ms, None);
     }
 
     #[test]
@@ -313,6 +325,23 @@ mod tests {
         let toml_str = r#"
             remote_addr = "example.com:4433"
             retry_interval = 0
+
+            [services.ssh]
+            token = "token"
+            local_addr = "127.0.0.1:22"
+        "#;
+
+        let mut config: ClientConfig = toml::from_str(toml_str).unwrap();
+        let result = config.validate();
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_client_config_validation_zero_quic_idle_timeout() {
+        let toml_str = r#"
+            remote_addr = "example.com:4433"
+            quic_idle_timeout_ms = 0
 
             [services.ssh]
             token = "token"

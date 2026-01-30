@@ -13,6 +13,7 @@
 - [Phase 5: 服务端实现](#phase-5-服务端实现)
 - [Phase 6: 客户端实现](#phase-6-客户端实现)
 - [Phase 7: 集成测试](#phase-7-集成测试)
+- [文档导航](#文档导航)
 
 ## TDD 原则
 
@@ -51,7 +52,7 @@
 
 ## 项目结构
 
-```
+```text
 quichole/
 ├── Cargo.toml              # Workspace 配置
 ├── shr/                    # 共享库
@@ -82,7 +83,8 @@ quichole/
 │   │   ├── main.rs
 │   │   ├── server.rs
 │   │   ├── service.rs
-│   │   └── connection.rs
+│   │   ├── handshake.rs
+│   │   └── runtime.rs
 │   └── tests/
 └── cli/                    # 客户端 (Phase 6)
     ├── Cargo.toml
@@ -90,9 +92,10 @@ quichole/
     │   ├── main.rs
     │   ├── client.rs
     │   ├── service.rs
-    │   └── connection.rs
+    │   ├── handshake.rs
+    │   └── runtime.rs
     └── tests/
-```
+```text
 
 ## Phase 1: 协议模块
 
@@ -692,6 +695,12 @@ fn default_heartbeat_interval() -> u64 {
 - `ServiceType::{Tcp,Udp}`（默认 TCP）
 
 > 注意：`toml` crate 不支持将 enum 直接序列化成顶层裸字符串（例如 `"tcp"`），测试时需要用 wrapper struct 作为字段序列化/反序列化。
+
+## 文档导航
+
+- 架构与时序图：`ARCHITECTURE.md`
+- 协议说明：`docs/PROTOCOL.md`
+- 配置说明：`docs/CONFIGURATION.md`
 
 ### Step 2.2: 配置验证
 
