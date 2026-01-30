@@ -14,11 +14,12 @@ use quichole_shr::quic::{
 use serde::{de::DeserializeOwned, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::time::Duration as StdDuration;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, oneshot};
-use tokio::time::{interval, Duration, MissedTickBehavior};
+use tokio::time::{interval, Duration, Instant, MissedTickBehavior};
 use tokio_quiche::metrics::{DefaultMetrics, Metrics};
 use tokio_quiche::quic::{ConnectionHook, SimpleConnectionIdGenerator};
 use tokio_quiche::settings::{CertificateKind, Hooks, QuicSettings, TlsCertificatePaths};
@@ -87,7 +88,13 @@ fn build_server_params(tls: &TlsConfig) -> Result<ConnectionParams<'_>> {
         private_key: key,
         kind: CertificateKind::X509,
     };
-    let settings = QuicSettings::default();
+    let mut settings = QuicSettings::default();
+    if let Some(timeout_ms) = std::env::var("QUIC_IDLE_TIMEOUT_MS")
+        .ok()
+        .and_then(|val| val.parse::<u64>().ok())
+    {
+        settings.max_idle_timeout = Some(StdDuration::from_millis(timeout_ms));
+    }
     let hooks = build_server_hooks(ca, tls.require_client_cert)?;
     Ok(ConnectionParams::new_server(settings, tls_paths, hooks))
 }
@@ -224,13 +231,16 @@ where
 
 async fn control_task(
     mut session: crate::handshake::ControlSession,
-    control_stream: QuicStreamHandle,
+    mut control_stream: QuicStreamHandle,
     mut manager: QuicStreamManager,
     mut req_rx: mpsc::Receiver<ControlRequest>,
     heartbeat_interval: u64,
 ) -> Result<()> {
     let mut ticker = interval(Duration::from_secs(heartbeat_interval));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let heartbeat_timeout = Duration::from_secs(heartbeat_interval.saturating_mul(3).max(3));
+    let mut last_heartbeat = Instant::now();
+    let mut control_decoder = FrameDecoder::new();
 
     loop {
         tokio::select! {
@@ -238,6 +248,22 @@ async fn control_task(
                 // Keep the QUIC connection alive and give clients a liveness signal.
                 // Client currently ignores the payload but reading it resets its idle timer.
                 send_framed(&control_stream, &ControlChannelCmd::Heartbeat).await?;
+                if last_heartbeat.elapsed() > heartbeat_timeout {
+                    return Err(anyhow!("control heartbeat timeout"));
+                }
+            }
+            cmd = recv_framed::<ControlChannelCmd>(&mut control_stream, &mut control_decoder) => {
+                match cmd {
+                    Ok(ControlChannelCmd::Heartbeat) => {
+                        last_heartbeat = Instant::now();
+                    }
+                    Ok(other) => {
+                        tracing::warn!(cmd = ?other, "unexpected control cmd from client");
+                    }
+                    Err(err) => {
+                        return Err(err);
+                    }
+                }
             }
             request = req_rx.recv() => {
                 let Some(request) = request else {

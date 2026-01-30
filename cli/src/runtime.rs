@@ -8,8 +8,11 @@ use quichole_shr::quic::{ConnectionRole, QuicApp, QuicConnectionState, QuicStrea
 use serde::{de::DeserializeOwned, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration as StdDuration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
+use tokio::sync::oneshot;
+use tokio::task::JoinSet;
 use tokio::time::{sleep, Duration};
 use tokio_quiche::quic::{connect_with_config, ConnectionHook};
 use tokio_quiche::settings::{CertificateKind, Hooks, QuicSettings, TlsCertificatePaths};
@@ -21,8 +24,16 @@ use crate::handshake::{auth_message, control_hello, data_channel_hello, verify_a
 use crate::service::ClientService;
 
 pub async fn run_client(client: ClientState) -> Result<()> {
+    let (_tx, rx) = oneshot::channel();
+    run_client_with_shutdown(client, rx).await
+}
+
+pub async fn run_client_with_shutdown(
+    client: ClientState,
+    mut shutdown: oneshot::Receiver<()>,
+) -> Result<()> {
     let client = Arc::new(client);
-    let mut handles = Vec::new();
+    let mut join_set = JoinSet::new();
 
     for name in client.config().services.keys() {
         let service = client
@@ -34,18 +45,23 @@ pub async fn run_client(client: ClientState) -> Result<()> {
         let retry = service
             .retry_interval()
             .unwrap_or(client.config().retry_interval);
-        handles.push(tokio::spawn(async move {
+        join_set.spawn(async move {
             if let Err(err) = run_service(remote_addr, tls, service, retry).await {
                 tracing::warn!(error = %err, "client service stopped");
             }
-        }));
+        });
     }
 
-    for handle in handles {
-        let _ = handle.await;
+    tokio::select! {
+        _ = async {
+            while join_set.join_next().await.is_some() {}
+        } => Ok(()),
+        _ = &mut shutdown => {
+            join_set.abort_all();
+            while join_set.join_next().await.is_some() {}
+            Ok(())
+        }
     }
-
-    Ok(())
 }
 
 async fn run_service(
@@ -98,6 +114,12 @@ async fn run_service_once(
         _ => None,
     };
     let mut settings = QuicSettings::default();
+    if let Some(timeout_ms) = std::env::var("QUIC_IDLE_TIMEOUT_MS")
+        .ok()
+        .and_then(|val| val.parse::<u64>().ok())
+    {
+        settings.max_idle_timeout = Some(StdDuration::from_millis(timeout_ms));
+    }
     settings.verify_peer = tls.verify_peer;
     let hooks = build_client_hooks(tls, tls_cert.is_some())?;
     let params = ConnectionParams::new_client(settings, tls_cert, hooks);
@@ -143,7 +165,14 @@ async fn run_service_once(
                 }
             };
         match cmd {
-            ControlChannelCmd::Heartbeat => continue,
+            ControlChannelCmd::Heartbeat => {
+                if let Err(err) = send_framed(&control_stream, &ControlChannelCmd::Heartbeat).await
+                {
+                    tracing::warn!(error = %err, "control channel heartbeat ack failed");
+                    return Err(err);
+                }
+                continue;
+            }
             ControlChannelCmd::CreateDataChannel => {
                 tracing::debug!("received create data channel");
                 let session_key: [u8; 32] =

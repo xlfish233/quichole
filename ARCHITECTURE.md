@@ -281,8 +281,9 @@ pub struct UdpTraffic {
 #### 2. 心跳机制
 
 - 服务端每隔 `heartbeat_interval` 秒发送 `Heartbeat` 命令
-- 客户端收到心跳后更新最后接收时间
-- 如果客户端在 `heartbeat_timeout` 秒内未收到心跳，认为连接断开
+- 客户端收到心跳后回发 `Heartbeat` 作为 ACK
+- 服务端若在 `heartbeat_interval * 3` 内未收到 ACK，认为连接断开
+- 客户端在 `heartbeat_timeout` 秒内未收到心跳，认为连接断开
 - 客户端将尝试重新连接
 - 控制通道关闭时，服务端停止对应服务监听，避免端口占用导致重连失败
 
