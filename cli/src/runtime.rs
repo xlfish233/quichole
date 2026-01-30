@@ -117,9 +117,16 @@ async fn run_service_once(
     }
 
     send_framed(&control_stream, &hello).await?;
+    tracing::debug!("hello sent, waiting for nonce");
     let nonce: [u8; 32] = recv_framed(&mut control_stream, &mut control_decoder).await?;
+    tracing::debug!("nonce received, sending auth");
     let auth = auth_message(service.token(), &nonce);
     send_framed(&control_stream, &auth).await?;
+    tracing::debug!("auth sent, yielding multiple times");
+    for _ in 0..5 {
+        tokio::task::yield_now().await;
+    }
+    tracing::debug!("waiting for ack");
     let ack: Ack = recv_framed(&mut control_stream, &mut control_decoder).await?;
     verify_ack(&ack)?;
     tracing::debug!("control handshake completed");
@@ -418,6 +425,7 @@ where
     T: Serialize,
 {
     let frame = encode_message(msg)?;
+    tracing::debug!(stream_id = stream.id(), len = frame.len(), "sending framed message");
     stream.send(Bytes::from(frame)).await
 }
 
@@ -425,14 +433,18 @@ async fn recv_framed<T>(stream: &mut QuicStreamHandle, decoder: &mut FrameDecode
 where
     T: DeserializeOwned,
 {
+    tracing::debug!(stream_id = stream.id(), "recv_framed: starting");
     loop {
         if let Some(result) = decoder.decode_next::<T>() {
+            tracing::debug!(stream_id = stream.id(), "received framed message from decoder cache");
             return result;
         }
+        tracing::trace!(stream_id = stream.id(), "recv_framed: waiting for chunk");
         let chunk = stream
             .recv()
             .await
             .ok_or_else(|| anyhow!("quic stream closed"))?;
+        tracing::debug!(stream_id = stream.id(), bytes = chunk.data.len(), fin = chunk.fin, "recv_framed: received chunk");
         decoder.push(&chunk.data);
         if chunk.fin {
             if let Some(result) = decoder.decode_next::<T>() {

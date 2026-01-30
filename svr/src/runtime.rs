@@ -5,7 +5,9 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use quichole_shr::config::{ServiceType, TlsConfig};
 use quichole_shr::protocol::{encode_message, FrameDecoder};
-use quichole_shr::protocol::{Ack, Auth, DataChannelCmd, Hello, UdpTraffic, PROTO_V1};
+use quichole_shr::protocol::{
+    Ack, Auth, ControlChannelCmd, DataChannelCmd, Hello, UdpTraffic, PROTO_V1,
+};
 use quichole_shr::quic::{
     QuicApp, QuicStreamHandle, QuicStreamManager, QuicStreamReceiver, QuicStreamSender,
 };
@@ -16,6 +18,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::{interval, Duration, MissedTickBehavior};
 use tokio_quiche::metrics::{DefaultMetrics, Metrics};
 use tokio_quiche::quic::{ConnectionHook, SimpleConnectionIdGenerator};
 use tokio_quiche::settings::{CertificateKind, Hooks, QuicSettings, TlsCertificatePaths};
@@ -176,8 +179,15 @@ where
         return Err(anyhow!("protocol version mismatch"));
     }
 
+    tracing::debug!("beginning control handshake");
     let handshake = begin_control_handshake(&server, &hello)?;
+    tracing::debug!("sending nonce");
     send_framed(&control_stream, handshake.nonce()).await?;
+    tracing::debug!("nonce sent, yielding multiple times");
+    for _ in 0..5 {
+        tokio::task::yield_now().await;
+    }
+    tracing::debug!("receiving auth");
 
     let auth: Auth = recv_framed(&mut control_stream, &mut control_decoder).await?;
     let session = match handshake.verify_auth(&auth) {
@@ -194,9 +204,12 @@ where
 
     let service = session.service().clone();
     let (req_tx, req_rx) = mpsc::channel(64);
+    let heartbeat_interval = server.config().heartbeat_interval;
 
     tokio::spawn(async move {
-        if let Err(err) = control_task(session, control_stream, manager, req_rx).await {
+        if let Err(err) =
+            control_task(session, control_stream, manager, req_rx, heartbeat_interval).await
+        {
             tracing::warn!(error = %err, "control task failed");
         }
     });
@@ -214,35 +227,52 @@ async fn control_task(
     control_stream: QuicStreamHandle,
     mut manager: QuicStreamManager,
     mut req_rx: mpsc::Receiver<ControlRequest>,
+    heartbeat_interval: u64,
 ) -> Result<()> {
-    while let Some(request) = req_rx.recv().await {
-        tracing::debug!("requesting data channel");
-        let (cmd, session_key) = session.create_data_channel();
-        send_framed(&control_stream, &cmd).await?;
-        send_framed(&control_stream, &session_key).await?;
+    let mut ticker = interval(Duration::from_secs(heartbeat_interval));
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
-        let mut data_stream = manager
-            .accept_stream()
-            .await
-            .ok_or_else(|| anyhow!("data stream closed"))?;
-        let stream_id = data_stream.id();
-        tracing::debug!(stream_id, "data stream accepted");
-        let mut data_decoder = FrameDecoder::new();
-        let hello: Hello = match recv_framed(&mut data_stream, &mut data_decoder).await {
-            Ok(hello) => hello,
-            Err(err) => {
-                tracing::warn!(error = %err, stream_id, "data channel hello failed");
-                return Err(err);
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                // Keep the QUIC connection alive and give clients a liveness signal.
+                // Client currently ignores the payload but reading it resets its idle timer.
+                send_framed(&control_stream, &ControlChannelCmd::Heartbeat).await?;
             }
-        };
-        let data_cmd = session.accept_data_channel_hello(&hello)?;
-        send_framed(&data_stream, &data_cmd).await?;
-        tracing::debug!(mode = ?data_cmd, "data channel ready");
+            request = req_rx.recv() => {
+                let Some(request) = request else {
+                    break;
+                };
 
-        let _ = request.response.send(Ok(PreparedDataStream {
-            stream: data_stream,
-            mode: data_cmd,
-        }));
+                tracing::debug!("requesting data channel");
+                let (cmd, session_key) = session.create_data_channel();
+                send_framed(&control_stream, &cmd).await?;
+                send_framed(&control_stream, &session_key).await?;
+
+                let mut data_stream = manager
+                    .accept_stream()
+                    .await
+                    .ok_or_else(|| anyhow!("data stream closed"))?;
+                let stream_id = data_stream.id();
+                tracing::debug!(stream_id, "data stream accepted");
+                let mut data_decoder = FrameDecoder::new();
+                let hello: Hello = match recv_framed(&mut data_stream, &mut data_decoder).await {
+                    Ok(hello) => hello,
+                    Err(err) => {
+                        tracing::warn!(error = %err, stream_id, "data channel hello failed");
+                        return Err(err);
+                    }
+                };
+                let data_cmd = session.accept_data_channel_hello(&hello)?;
+                send_framed(&data_stream, &data_cmd).await?;
+                tracing::debug!(mode = ?data_cmd, "data channel ready");
+
+                let _ = request.response.send(Ok(PreparedDataStream {
+                    stream: data_stream,
+                    mode: data_cmd,
+                }));
+            }
+        }
     }
 
     Ok(())
@@ -255,14 +285,24 @@ async fn run_tcp_service(bind_addr: String, req_tx: mpsc::Sender<ControlRequest>
     tracing::info!(bind_addr = %bind_addr, "tcp service listening");
 
     loop {
-        let (socket, peer) = listener.accept().await?;
-        let req_tx = req_tx.clone();
-        tokio::spawn(async move {
-            if let Err(err) = handle_tcp_connection(socket, peer, req_tx).await {
-                tracing::warn!(error = %err, "tcp forward failed");
+        tokio::select! {
+            _ = req_tx.closed() => {
+                tracing::info!(bind_addr = %bind_addr, "control channel closed, stopping tcp service");
+                break;
             }
-        });
+            accept = listener.accept() => {
+                let (socket, peer) = accept?;
+                let req_tx = req_tx.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = handle_tcp_connection(socket, peer, req_tx).await {
+                        tracing::warn!(error = %err, "tcp forward failed");
+                    }
+                });
+            }
+        }
     }
+
+    Ok(())
 }
 
 async fn handle_tcp_connection(
@@ -289,7 +329,13 @@ async fn run_udp_service(bind_addr: String, req_tx: mpsc::Sender<ControlRequest>
     let mut buf = vec![0u8; 64 * 1024];
 
     loop {
-        let (n, peer) = socket.recv_from(&mut buf).await?;
+        tokio::select! {
+            _ = req_tx.closed() => {
+                tracing::info!(bind_addr = %bind_addr, "control channel closed, stopping udp service");
+                break;
+            }
+            recv = socket.recv_from(&mut buf) => {
+                let (n, peer) = recv?;
         let sender = if let Some(session) = sessions.get(&peer) {
             session.sender.clone()
         } else {
@@ -311,7 +357,11 @@ async fn run_udp_service(bind_addr: String, req_tx: mpsc::Sender<ControlRequest>
         };
         let frame = encode_message(&traffic)?;
         sender.send(Bytes::from(frame)).await?;
+            }
+        }
     }
+
+    Ok(())
 }
 
 struct UdpSession {
@@ -406,21 +456,33 @@ where
     T: Serialize,
 {
     let frame = encode_message(msg)?;
-    stream.send(Bytes::from(frame)).await
+    tracing::debug!(stream_id = stream.id(), len = frame.len(), "sending framed message");
+    stream.send(Bytes::from(frame)).await?;
+    
+    // 确保数据有机会被发送到网络
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    
+    Ok(())
 }
 
 async fn recv_framed<T>(stream: &mut QuicStreamHandle, decoder: &mut FrameDecoder) -> Result<T>
 where
     T: DeserializeOwned,
 {
+    tracing::debug!(stream_id = stream.id(), "recv_framed: starting");
     loop {
         if let Some(result) = decoder.decode_next::<T>() {
+            tracing::debug!(stream_id = stream.id(), "received framed message from decoder cache");
             return result;
         }
+        tracing::trace!(stream_id = stream.id(), "recv_framed: waiting for chunk");
         let chunk = stream
             .recv()
             .await
             .ok_or_else(|| anyhow!("quic stream closed"))?;
+        tracing::debug!(stream_id = stream.id(), bytes = chunk.data.len(), fin = chunk.fin, "recv_framed: received chunk");
         decoder.push(&chunk.data);
         if chunk.fin {
             if let Some(result) = decoder.decode_next::<T>() {

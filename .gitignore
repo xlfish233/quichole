@@ -2,7 +2,13 @@
 /certs
 *.key
 *.pem
+.tmp/
 .idea
 .vscode
 .DS_Store
 *.log
+client.toml
+server.toml
+run_debug.sh
+server.ts
+test_manual.rs

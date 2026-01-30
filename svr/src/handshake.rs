@@ -103,10 +103,17 @@ pub fn begin_control_handshake(server: &ServerState, hello: &Hello) -> Result<Co
         bail!("protocol version mismatch");
     }
 
+    tracing::debug!(
+        digest = %format!("{:02x?}", &service_digest[..8]),
+        "looking up service by digest"
+    );
+
     let service = server
         .service_by_digest(service_digest)
         .context("service not exist")?
         .clone();
+
+    tracing::debug!(service = %service.name(), "service found by digest");
 
     Ok(ControlHandshake {
         service,
