@@ -167,6 +167,7 @@ async fn test_quic_tcp_forward_mtls_end_to_end() -> Result<()> {
         bind_addr: format!("127.0.0.1:{quic_port}"),
         heartbeat_interval: 30,
         heartbeat_ack_timeout: None,
+        quic_idle_timeout_ms: None,
         default_token: Some("e2e_secret".to_string()),
         tls: TlsConfig {
             cert: Some(server_cert_path.to_string_lossy().to_string()),
@@ -189,6 +190,7 @@ async fn test_quic_tcp_forward_mtls_end_to_end() -> Result<()> {
         remote_addr: format!("127.0.0.1:{quic_port}"),
         heartbeat_timeout: 40,
         retry_interval: 1,
+        quic_idle_timeout_ms: None,
         default_token: Some("e2e_secret".to_string()),
         tls: TlsConfig {
             server_name: Some("localhost".to_string()),
