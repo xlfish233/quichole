@@ -8,7 +8,7 @@
 ![License](https://img.shields.io/github/license/xlfish233/quichole)
 ![Release](https://img.shields.io/github/v/release/xlfish233/quichole)
 
-**快速链接**：`docs/DEPLOYMENT.md` | `docs/SECURITY.md` | `docs/OPERATIONS.md` | `docs/CONFIGURATION.md`
+**快速链接**：[部署指南](docs/DEPLOYMENT.md) | [安全文档](docs/SECURITY.md) | [运维手册](docs/OPERATIONS.md) | [配置说明](docs/CONFIGURATION.md)
 
 ## 特性
 
@@ -132,14 +132,11 @@ quichole-cli -c client.toml
 
 ## 适合 / 不适合
 
-**适合：**
-- 需要多路复用、避免队头阻塞的内网穿透
-- 频繁切换网络（移动网络）或需要连接迁移
-- 对握手延迟敏感，期望 0-RTT 重连
-
-**不适合：**
-- UDP 被严格屏蔽的网络环境
-- 只能接受 TCP 转发的封闭网络
+| 适合 | 不适合 |
+|------|--------|
+| 需要多路复用、避免队头阻塞的内网穿透 | UDP 被严格屏蔽的网络环境 |
+| 频繁切换网络（移动网络）或需要连接迁移 | 只能接受 TCP 转发的封闭网络 |
+| 对握手延迟敏感，期望 0-RTT 重连 | |
 
 ## 生产就绪声明
 
@@ -157,20 +154,6 @@ quichole-cli -c client.toml
 | 连接迁移 | ✅ 支持 | ❌ |
 | NAT 穿透 | ✅ 更容易 (UDP) | ⚠️ 较难 (TCP) |
 | 队头阻塞 | ✅ 无 | ⚠️ 可能存在 |
-
-## 开发状态
-
-🚧 **项目处于早期开发阶段**
-
-- [x] 项目架构设计
-- [x] 协议定义（Phase 1）
-- [x] 加密/认证模块（Phase 3）
-- [x] 配置文件支持（Phase 2.1/2.2）
-- [x] 服务端实现（MVP 传输/转发）
-- [x] 客户端实现（MVP 传输/转发）
-- [x] 端到端测试（QUIC TCP + mTLS）
-- [ ] 更丰富的集成测试
-- [ ] 文档完善（持续更新）
 
 ## FAQ
 
