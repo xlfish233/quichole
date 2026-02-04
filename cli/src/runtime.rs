@@ -2,6 +2,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use boring::ssl::{SslContextBuilder, SslFiletype, SslMethod, SslVerifyMode};
 use bytes::Bytes;
 use quichole_shr::config::TlsConfig;
+use quichole_shr::logging::{RedactedNonce, ShutdownSignal};
 use quichole_shr::protocol::{encode_message, FrameDecoder};
 use quichole_shr::protocol::{Ack, ControlChannelCmd, DataChannelCmd, UdpTraffic, PROTO_V1};
 use quichole_shr::quic::{ConnectionRole, QuicApp, QuicConnectionState, QuicStreamHandle};
@@ -11,7 +12,6 @@ use std::sync::Arc;
 use std::time::Duration as StdDuration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::sync::oneshot;
 use tokio::task::JoinSet;
 use tokio::time::{sleep, Duration};
 use tokio_quiche::quic::{connect_with_config, ConnectionHook};
@@ -23,17 +23,17 @@ use crate::client::ClientState;
 use crate::handshake::{auth_message, control_hello, data_channel_hello, verify_ack};
 use crate::service::ClientService;
 
-pub async fn run_client(client: ClientState) -> Result<()> {
-    let (_tx, rx) = oneshot::channel();
-    run_client_with_shutdown(client, rx).await
+pub async fn run_client(client: ClientState, shutdown: ShutdownSignal) -> Result<()> {
+    run_client_with_shutdown(client, shutdown).await
 }
 
 pub async fn run_client_with_shutdown(
     client: ClientState,
-    mut shutdown: oneshot::Receiver<()>,
+    shutdown: ShutdownSignal,
 ) -> Result<()> {
     let client = Arc::new(client);
     let mut join_set = JoinSet::new();
+    let mut shutdown_rx = shutdown.subscribe();
 
     for name in client.config().services.keys() {
         let service = client
@@ -46,9 +46,11 @@ pub async fn run_client_with_shutdown(
             .retry_interval()
             .unwrap_or(client.config().retry_interval);
         let quic_idle_timeout_ms = client.config().quic_idle_timeout_ms;
+        let service_shutdown = shutdown.clone();
+
         join_set.spawn(async move {
             if let Err(err) =
-                run_service(remote_addr, tls, service, retry, quic_idle_timeout_ms).await
+                run_service_with_shutdown(remote_addr, tls, service, retry, quic_idle_timeout_ms, service_shutdown).await
             {
                 tracing::warn!(error = %err, "client service stopped");
             }
@@ -59,7 +61,8 @@ pub async fn run_client_with_shutdown(
         _ = async {
             while join_set.join_next().await.is_some() {}
         } => Ok(()),
-        _ = &mut shutdown => {
+        _ = shutdown_rx.recv() => {
+            tracing::info!("client shutdown signal received");
             join_set.abort_all();
             while join_set.join_next().await.is_some() {}
             Ok(())
@@ -67,24 +70,34 @@ pub async fn run_client_with_shutdown(
     }
 }
 
-async fn run_service(
+async fn run_service_with_shutdown(
     remote_addr: String,
     tls: TlsConfig,
     service: ClientService,
     retry_interval: u64,
     quic_idle_timeout_ms: Option<u64>,
+    shutdown: ShutdownSignal,
 ) -> Result<()> {
     loop {
-        match run_service_once(&remote_addr, &tls, &service, quic_idle_timeout_ms).await {
-            Ok(()) => return Ok(()),
-            Err(err) => {
-                tracing::warn!(
-                    error = %err,
-                    service = service.name(),
-                    retry_interval,
-                    "service connection failed, retrying"
-                );
-                sleep(Duration::from_secs(retry_interval)).await;
+        let mut shutdown_rx = shutdown.subscribe();
+        tokio::select! {
+            _ = shutdown_rx.recv() => {
+                tracing::info!(service = service.name(), "service shutdown requested");
+                return Ok(());
+            }
+            result = run_service_once(&remote_addr, &tls, &service, quic_idle_timeout_ms) => {
+                match result {
+                    Ok(()) => return Ok(()),
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            service = service.name(),
+                            retry_interval,
+                            "service connection failed, retrying"
+                        );
+                        sleep(Duration::from_secs(retry_interval)).await;
+                    }
+                }
             }
         }
     }
@@ -143,8 +156,12 @@ async fn run_service_once(
     send_framed(&control_stream, &hello).await?;
     tracing::debug!("hello sent, waiting for nonce");
     let nonce: [u8; 32] = recv_framed(&mut control_stream, &mut control_decoder).await?;
-    tracing::debug!("nonce received, sending auth");
+    tracing::debug!(
+        nonce = %RedactedNonce(nonce),
+        "nonce received from server, sending auth"
+    );
     let auth = auth_message(service.token(), &nonce);
+    tracing::debug!("auth message computed from token and nonce");
     send_framed(&control_stream, &auth).await?;
     tracing::debug!("auth sent, yielding multiple times");
     for _ in 0..5 {
