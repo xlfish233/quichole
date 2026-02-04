@@ -7,7 +7,7 @@ version = "0.1.0"
 edition = "2021"
 authors = ["quichole contributors"]
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/yourusername/quichole"
+repository = "https://github.com/xlfish233/quichole"
 
 [workspace.dependencies]
 quiche = "0.24"

@@ -4,9 +4,9 @@
 
 适合：需要更低队头阻塞、连接迁移与 0-RTT 重连的内网服务暴露。
 
-![CI](https://img.shields.io/github/actions/workflow/status/yourusername/quichole/ci.yml?branch=master)
-![License](https://img.shields.io/github/license/yourusername/quichole)
-![Release](https://img.shields.io/github/v/release/yourusername/quichole)
+![CI](https://img.shields.io/github/actions/workflow/status/xlfish233/quichole/ci.yml?branch=master)
+![License](https://img.shields.io/github/license/xlfish233/quichole)
+![Release](https://img.shields.io/github/v/release/xlfish233/quichole)
 
 **快速链接**：`docs/DEPLOYMENT.md` | `docs/SECURITY.md` | `docs/OPERATIONS.md` | `docs/CONFIGURATION.md`
 
@@ -24,6 +24,27 @@
 - 多路复用避免队头阻塞
 - 连接迁移适应 IP 变化
 - 0-RTT 让重连更快
+
+## 安装
+
+### 从 Release 下载
+
+前往 [Releases](https://github.com/xlfish233/quichole/releases) 下载对应平台的预编译二进制。
+
+### 从源码编译
+
+```bash
+# 克隆仓库
+git clone https://github.com/xlfish233/quichole.git
+cd quichole
+
+# 编译 release 版本
+cargo build --release
+
+# 二进制位于
+# ./target/release/quichole-svr  (服务端)
+# ./target/release/quichole-cli  (客户端)
+```
 
 ## 快速开始（最小可运行）
 
@@ -75,8 +96,8 @@ openssl req -x509 -newkey rsa:2048 -nodes \
 3) 运行
 
 ```bash
-quichole-server -c server.toml
-quichole-client -c client.toml
+quichole-svr -c server.toml
+quichole-cli -c client.toml
 ```
 
 现在你可以通过 `your-server.com:2222` 访问内网 SSH。
@@ -153,11 +174,11 @@ quichole-client -c client.toml
 
 ## FAQ
 
-- 连接失败：检查 UDP 入站、防火墙与安全组
-- 证书校验失败：确认 `server_name` 与证书 SAN 匹配
-- 服务不可达：检查 `bind_addr`/`local_addr` 是否正确
-- 频繁重连：调节心跳参数，检查网络抖动
-- mTLS 失败：确认 `tls.ca`、`tls.cert`、`tls.key` 是否齐全
+- **连接失败**：检查 UDP 入站、防火墙与安全组，详见 [运维文档](docs/OPERATIONS.md#连接问题)
+- **证书校验失败**：确认 `server_name` 与证书 SAN 匹配，详见 [安全文档](docs/SECURITY.md)
+- **服务不可达**：检查 `bind_addr`/`local_addr` 是否正确，详见 [配置文档](docs/CONFIGURATION.md)
+- **频繁重连**：调节心跳参数，检查网络抖动，详见 [运维文档](docs/OPERATIONS.md#重连问题)
+- **mTLS 失败**：确认 `tls.ca`、`tls.cert`、`tls.key` 是否齐全，详见 [安全文档](docs/SECURITY.md#mtls)
 
 ## 路线图（简版）
 
@@ -172,3 +193,9 @@ quichole-client -c client.toml
 ## 许可证
 
 MIT OR Apache-2.0
+
+## 系统要求
+
+- **Rust**: 1.70+ (edition 2021)
+- **操作系统**: Linux, macOS, Windows
+- **网络**: 需要 UDP 出站（客户端）/ 入站（服务端）
