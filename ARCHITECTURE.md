@@ -36,7 +36,10 @@ quichole/
 ├── docs/               # 设计与配置文档
 │   ├── CONFIGURATION.md
 │   ├── PROTOCOL.md
-│   └── IMPLEMENTATION.md
+│   ├── IMPLEMENTATION.md
+│   ├── DEPLOYMENT.md
+│   ├── SECURITY.md
+│   └── OPERATIONS.md
 ├── shr/                # 共享库 (quichole-shr)
 │   ├── Cargo.toml
 │   └── src/

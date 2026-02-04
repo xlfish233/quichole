@@ -31,6 +31,9 @@
 - 协议说明：`docs/PROTOCOL.md`
 - 配置说明：`docs/CONFIGURATION.md`
 - 实施/阶段说明：`docs/IMPLEMENTATION.md`
+- 生产部署与运维：`docs/DEPLOYMENT.md`
+- 安全与证书：`docs/SECURITY.md`
+- 运维与排障：`docs/OPERATIONS.md`
 
 ## 快速开始
 
@@ -91,7 +94,7 @@ token = "your_secret_token"
 bind_addr = "0.0.0.0:2222"
 ```
 
-生成自签证书（开发环境）：
+生成自签证书（开发环境，注意 SAN 要匹配 `server_name`）：
 
 ```bash
 mkdir -p certs
@@ -99,7 +102,8 @@ openssl req -x509 -newkey rsa:2048 -nodes \
   -keyout certs/server.key \
   -out certs/server.pem \
   -days 365 \
-  -subj "/CN=localhost"
+  -subj "/CN=your-server.com" \
+  -addext "subjectAltName=DNS:your-server.com"
 ```
 
 运行服务端:

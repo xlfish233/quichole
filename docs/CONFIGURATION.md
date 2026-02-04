@@ -9,6 +9,9 @@
 - 架构与时序图：`ARCHITECTURE.md`
 - 协议说明：`docs/PROTOCOL.md`
 - 实施/阶段说明：`docs/IMPLEMENTATION.md`
+- 生产部署与运维：`docs/DEPLOYMENT.md`
+- 安全与证书：`docs/SECURITY.md`
+- 运维与排障：`docs/OPERATIONS.md`
 
 ## 服务端配置（server.toml）
 
@@ -17,6 +20,8 @@ bind_addr = "0.0.0.0:4433"
 heartbeat_interval = 30
 # 可选：心跳 ACK 超时，默认 heartbeat_interval * 3
 # heartbeat_ack_timeout = 90
+# 可选：QUIC 空闲超时（毫秒）
+# quic_idle_timeout_ms = 60000
 # 可选：为未填写 token 的服务提供默认值
 # default_token = "default_secret"
 
@@ -42,6 +47,7 @@ type = "udp"
 - `bind_addr`：服务端 QUIC 监听地址
 - `heartbeat_interval`：心跳间隔（秒，默认 30）
 - `heartbeat_ack_timeout`：心跳 ACK 超时（秒，默认 `heartbeat_interval * 3`）
+- `quic_idle_timeout_ms`：QUIC 空闲超时（毫秒，可选）
 - `default_token`：服务级 token 的默认值（可选）
 - `tls`：TLS 配置（支持私有 CA / mTLS）
   - `cert`：服务端证书路径（PEM）
@@ -59,6 +65,8 @@ type = "udp"
 remote_addr = "example.com:4433"
 heartbeat_timeout = 40
 retry_interval = 1
+# 可选：QUIC 空闲超时（毫秒）
+# quic_idle_timeout_ms = 60000
 # 可选：为未填写 token 的服务提供默认值
 # default_token = "default_secret"
 
@@ -87,6 +95,7 @@ retry_interval = 5
 - `remote_addr`：服务端地址
 - `heartbeat_timeout`：心跳超时（秒，默认 40）
 - `retry_interval`：重试间隔（秒，默认 1）
+- `quic_idle_timeout_ms`：QUIC 空闲超时（毫秒，可选）
 - `default_token`：服务级 token 的默认值（可选）
 - `tls`：TLS 配置（支持私有 CA / mTLS）
   - `server_name`：SNI 名称（可选，默认从 `remote_addr` 提取）
@@ -113,6 +122,49 @@ retry_interval = 5
 - TLS 证书为运行时依赖：服务端需要提供 `tls.cert` + `tls.key`
 - 当 `tls.require_client_cert = true` 时，服务端还需要 `tls.ca`
 - 客户端启用私有 CA / mTLS（配置 `tls.ca`）时，需要提供 `tls.cert` + `tls.key`
+
+## 日志配置（server/client 通用）
+
+日志配置在服务端/客户端均通过 `logging` 字段提供。示例：
+
+```toml
+[logging]
+level = "info"
+format = "pretty"           # pretty/json
+with_file_location = false
+with_target = true
+
+[logging.console]
+enabled = true
+use_stderr = false
+ansi = true
+
+[logging.file]
+enabled = false
+directory = "/var/log/quichole"
+prefix = "quichole"
+rotation_size = 104857600    # 100 MB
+rotation_interval = "daily"  # hourly/daily/never
+retention_count = 30
+separate_error_log = false
+level = "debug"
+
+[logging.filters]
+overrides = "quichole_svr=debug,quichole_cli=debug"
+
+[logging.redaction]
+enabled = true
+
+[logging.metrics]
+enabled = false
+interval_seconds = 60
+include_connection_stats = true
+include_memory_stats = false
+
+[logging.async]
+buffer_size = 1024
+backpressure_behavior = "block" # block/drop
+```
 
 ## CLI 使用
 
