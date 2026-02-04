@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use quichole_shr::config::ServerConfig;
+use quichole_shr::logging::ShutdownSignal;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -9,6 +10,11 @@ use quichole_shr::protocol::{service_digest, Auth, Hello, PROTO_V1};
 use quichole_svr::handshake::begin_control_handshake;
 use quichole_svr::runtime::run_server;
 use quichole_svr::server::ServerState;
+
+use tokio::signal::ctrl_c;
+
+#[cfg(unix)]
+use tokio::signal::unix::{self, SignalKind};
 
 #[derive(Parser, Debug)]
 #[command(name = "quichole-server", version, about = "Quichole server")]
@@ -29,12 +35,42 @@ fn load_config(path: &Path) -> Result<ServerConfig> {
     Ok(config)
 }
 
+/// Wait for Ctrl+C or SIGTERM and return when received
+async fn wait_for_shutdown_signal() {
+    let ctrl_c = async {
+        ctrl_c().await.expect("failed to install Ctrl+C handler");
+        tracing::info!("received Ctrl+C, initiating shutdown");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        let mut sig_term = unix::signal(SignalKind::terminate())
+            .expect("failed to install SIGTERM handler");
+        sig_term.recv().await;
+        tracing::info!("received SIGTERM, initiating shutdown");
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    // Phase 1: Minimal logging before config
+    let _minimal_guard = quichole_shr::logging::init_minimal_logging();
 
     let args = Args::parse();
     let config = load_config(&args.config)?;
+
+    // Phase 2: Full logging after config
+    let (_log_guard, _reload_handle) = quichole_shr::logging::init_logging(&config.logging)
+        .context("failed to initialize logging")?;
+
     let server = ServerState::from_config(config)?;
     let config_ref = server.config();
     tracing::info!(
@@ -62,7 +98,17 @@ async fn main() -> Result<()> {
     #[cfg(debug_assertions)]
     debug_self_check(&server);
 
-    run_server(server).await
+    // Create shutdown signal
+    let shutdown = ShutdownSignal::new();
+    let shutdown_trigger = shutdown.clone();
+
+    // Spawn signal handler task
+    tokio::spawn(async move {
+        wait_for_shutdown_signal().await;
+        shutdown_trigger.shutdown();
+    });
+
+    run_server(server, shutdown).await
 }
 
 #[cfg(debug_assertions)]

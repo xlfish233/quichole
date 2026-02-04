@@ -4,6 +4,7 @@ use boring::x509::X509;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use quichole_shr::config::{ServiceType, TlsConfig};
+use quichole_shr::logging::ShutdownSignal;
 use quichole_shr::protocol::{encode_message, FrameDecoder};
 use quichole_shr::protocol::{
     Ack, Auth, ControlChannelCmd, DataChannelCmd, Hello, UdpTraffic, PROTO_V1,
@@ -28,7 +29,7 @@ use tokio_quiche::{listen, ConnectionParams};
 use crate::handshake::begin_control_handshake;
 use crate::server::ServerState;
 
-pub async fn run_server(server: ServerState) -> Result<()> {
+pub async fn run_server(server: ServerState, shutdown: ShutdownSignal) -> Result<()> {
     let server = Arc::new(server);
     let bind_addr = server.config().bind_addr.clone();
     let tls = server.config().tls.clone();
@@ -50,14 +51,35 @@ pub async fn run_server(server: ServerState) -> Result<()> {
 
     tracing::info!(bind_addr = %bind_addr, "quic listener started");
 
-    while let Some(conn) = listener.next().await {
-        let conn = conn?;
-        let server = server.clone();
-        tokio::spawn(async move {
-            if let Err(err) = handle_connection(server, conn).await {
-                tracing::warn!(error = %err, "quic connection ended");
+    let mut shutdown_rx = shutdown.subscribe();
+
+    loop {
+        tokio::select! {
+            conn_result = listener.next() => {
+                match conn_result {
+                    Some(Ok(conn)) => {
+                        let server = server.clone();
+                        let shutdown = shutdown.clone();
+                        tokio::spawn(async move {
+                            if let Err(err) = handle_connection(server, conn, shutdown).await {
+                                tracing::warn!(error = %err, "quic connection ended");
+                            }
+                        });
+                    }
+                    Some(Err(err)) => {
+                        tracing::warn!(error = %err, "quic connection failed");
+                    }
+                    None => {
+                        tracing::info!("listener exhausted, stopping server");
+                        break;
+                    }
+                }
             }
-        });
+            _ = shutdown_rx.recv() => {
+                tracing::info!("shutdown signal received, stopping server");
+                break;
+            }
+        }
     }
 
     Ok(())
@@ -170,6 +192,7 @@ struct PreparedDataStream {
 async fn handle_connection<M>(
     server: Arc<ServerState>,
     conn: tokio_quiche::InitialQuicConnection<tokio::net::UdpSocket, M>,
+    shutdown: ShutdownSignal,
 ) -> Result<()>
 where
     M: Metrics,
@@ -217,15 +240,20 @@ where
         .heartbeat_ack_timeout
         .unwrap_or_else(|| heartbeat_interval.saturating_mul(3).max(3));
 
+    // Clone shutdown for use in both tasks
+    let shutdown_for_control = shutdown.clone();
+    let shutdown_for_service = shutdown.clone();
+
     tokio::spawn(async move {
         if let Err(err) =
-            control_task(
+            control_task_with_shutdown(
                 session,
                 control_stream,
                 manager,
                 req_rx,
                 heartbeat_interval,
                 heartbeat_ack_timeout,
+                shutdown_for_control,
             )
             .await
         {
@@ -234,26 +262,28 @@ where
     });
 
     match service.service_type() {
-        ServiceType::Tcp => run_tcp_service(service.bind_addr().to_string(), req_tx).await?,
-        ServiceType::Udp => run_udp_service(service.bind_addr().to_string(), req_tx).await?,
+        ServiceType::Tcp => run_tcp_service_with_shutdown(service.bind_addr().to_string(), req_tx, shutdown_for_service).await?,
+        ServiceType::Udp => run_udp_service_with_shutdown(service.bind_addr().to_string(), req_tx, shutdown_for_service).await?,
     }
 
     Ok(())
 }
 
-async fn control_task(
+async fn control_task_with_shutdown(
     mut session: crate::handshake::ControlSession,
     mut control_stream: QuicStreamHandle,
     mut manager: QuicStreamManager,
     mut req_rx: mpsc::Receiver<ControlRequest>,
     heartbeat_interval: u64,
     heartbeat_ack_timeout: u64,
+    shutdown: ShutdownSignal,
 ) -> Result<()> {
     let mut ticker = interval(Duration::from_secs(heartbeat_interval));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let heartbeat_timeout = Duration::from_secs(heartbeat_ack_timeout.max(1));
     let mut last_heartbeat = Instant::now();
     let mut control_decoder = FrameDecoder::new();
+    let mut shutdown_rx = shutdown.subscribe();
 
     loop {
         tokio::select! {
@@ -311,17 +341,27 @@ async fn control_task(
                     mode: data_cmd,
                 }));
             }
+            _ = shutdown_rx.recv() => {
+                tracing::info!("shutdown signal received in control task");
+                break;
+            }
         }
     }
 
     Ok(())
 }
 
-async fn run_tcp_service(bind_addr: String, req_tx: mpsc::Sender<ControlRequest>) -> Result<()> {
+async fn run_tcp_service_with_shutdown(
+    bind_addr: String,
+    req_tx: mpsc::Sender<ControlRequest>,
+    shutdown: ShutdownSignal,
+) -> Result<()> {
     let listener = TcpListener::bind(&bind_addr)
         .await
         .with_context(|| format!("bind tcp {}", bind_addr))?;
     tracing::info!(bind_addr = %bind_addr, "tcp service listening");
+
+    let mut shutdown_rx = shutdown.subscribe();
 
     loop {
         tokio::select! {
@@ -337,6 +377,10 @@ async fn run_tcp_service(bind_addr: String, req_tx: mpsc::Sender<ControlRequest>
                         tracing::warn!(error = %err, "tcp forward failed");
                     }
                 });
+            }
+            _ = shutdown_rx.recv() => {
+                tracing::info!(bind_addr = %bind_addr, "shutdown signal received, stopping tcp service");
+                break;
             }
         }
     }
@@ -357,7 +401,11 @@ async fn handle_tcp_connection(
     }
 }
 
-async fn run_udp_service(bind_addr: String, req_tx: mpsc::Sender<ControlRequest>) -> Result<()> {
+async fn run_udp_service_with_shutdown(
+    bind_addr: String,
+    req_tx: mpsc::Sender<ControlRequest>,
+    shutdown: ShutdownSignal,
+) -> Result<()> {
     let socket = UdpSocket::bind(&bind_addr)
         .await
         .with_context(|| format!("bind udp {}", bind_addr))?;
@@ -366,6 +414,7 @@ async fn run_udp_service(bind_addr: String, req_tx: mpsc::Sender<ControlRequest>
     let socket = Arc::new(socket);
     let mut sessions: HashMap<SocketAddr, UdpSession> = HashMap::new();
     let mut buf = vec![0u8; 64 * 1024];
+    let mut shutdown_rx = shutdown.subscribe();
 
     loop {
         tokio::select! {
@@ -396,6 +445,10 @@ async fn run_udp_service(bind_addr: String, req_tx: mpsc::Sender<ControlRequest>
         };
         let frame = encode_message(&traffic)?;
         sender.send(Bytes::from(frame)).await?;
+            }
+            _ = shutdown_rx.recv() => {
+                tracing::info!(bind_addr = %bind_addr, "shutdown signal received, stopping udp service");
+                break;
             }
         }
     }

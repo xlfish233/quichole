@@ -1,6 +1,7 @@
 use anyhow::{bail, Context, Result};
 use quichole_shr::config::ServiceType;
 use quichole_shr::crypto::verify_auth_digest;
+use quichole_shr::logging::{RedactedNonce, RedactedSessionKey};
 use quichole_shr::protocol::{
     generate_nonce, generate_session_key, Auth, ControlChannelCmd, DataChannelCmd, Hello, PROTO_V1,
 };
@@ -39,6 +40,10 @@ struct DataChannelManager {
 impl DataChannelManager {
     fn create_request(&mut self, service_type: ServiceType) -> [u8; 32] {
         let session_key = generate_session_key();
+        tracing::debug!(
+            session_key = %RedactedSessionKey(session_key),
+            "server generated session key for data channel"
+        );
         self.pending.insert(session_key, service_type);
         session_key
     }
@@ -104,7 +109,7 @@ pub fn begin_control_handshake(server: &ServerState, hello: &Hello) -> Result<Co
     }
 
     tracing::debug!(
-        digest = %format!("{:02x?}", &service_digest[..8]),
+        service_digest = %format!("{:02x}***", service_digest[0]),
         "looking up service by digest"
     );
 
@@ -115,9 +120,15 @@ pub fn begin_control_handshake(server: &ServerState, hello: &Hello) -> Result<Co
 
     tracing::debug!(service = %service.name(), "service found by digest");
 
+    let nonce = generate_nonce();
+    tracing::debug!(
+        nonce = %RedactedNonce(nonce),
+        "server generated nonce for handshake"
+    );
+
     Ok(ControlHandshake {
         service,
-        nonce: generate_nonce(),
+        nonce,
     })
 }
 
