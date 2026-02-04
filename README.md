@@ -1,6 +1,14 @@
 # Quichole
 
-一个基于 QUIC 协议的安全、高性能内网穿透工具。
+基于 QUIC 的安全、高性能内网穿透工具，面向多路复用与低延迟场景。
+
+适合：需要更低队头阻塞、连接迁移与 0-RTT 重连的内网服务暴露。
+
+![CI](https://img.shields.io/github/actions/workflow/status/yourusername/quichole/ci.yml?branch=master)
+![License](https://img.shields.io/github/license/yourusername/quichole)
+![Release](https://img.shields.io/github/v/release/yourusername/quichole)
+
+**快速链接**：`docs/DEPLOYMENT.md` | `docs/SECURITY.md` | `docs/OPERATIONS.md` | `docs/CONFIGURATION.md`
 
 ## 特性
 
@@ -10,6 +18,70 @@
 - 📱 **连接迁移**: IP 地址变化时连接不中断
 - 🪶 **轻量级**: 最小化资源占用，适合嵌入式设备
 - 🔧 **易配置**: 简单的 TOML 配置文件
+
+## 为什么是 QUIC
+
+- 多路复用避免队头阻塞
+- 连接迁移适应 IP 变化
+- 0-RTT 让重连更快
+
+## 快速开始（最小可运行）
+
+1) 准备配置文件
+
+`server.toml`：
+
+```toml
+bind_addr = "0.0.0.0:4433"
+default_token = "demo_secret"
+
+[tls]
+cert = "certs/server.pem"
+key = "certs/server.key"
+
+[services.ssh]
+bind_addr = "0.0.0.0:2222"
+token = ""
+type = "tcp"
+```
+
+`client.toml`：
+
+```toml
+remote_addr = "your-server.com:4433"
+default_token = "demo_secret"
+
+[tls]
+server_name = "your-server.com"
+
+[services.ssh]
+local_addr = "127.0.0.1:22"
+token = ""
+type = "tcp"
+```
+
+2) 生成证书（开发环境，SAN 要匹配 `server_name`）
+
+```bash
+mkdir -p certs
+openssl req -x509 -newkey rsa:2048 -nodes \
+  -keyout certs/server.key \
+  -out certs/server.pem \
+  -days 365 \
+  -subj "/CN=your-server.com" \
+  -addext "subjectAltName=DNS:your-server.com"
+```
+
+3) 运行
+
+```bash
+quichole-server -c server.toml
+quichole-client -c client.toml
+```
+
+现在你可以通过 `your-server.com:2222` 访问内网 SSH。
+
+> 生产部署与运维请看：`docs/DEPLOYMENT.md`
 
 ## 架构
 
@@ -27,119 +99,32 @@
 
 ## 文档导航
 
-- 架构与时序图：`ARCHITECTURE.md`
-- 协议说明：`docs/PROTOCOL.md`
-- 配置说明：`docs/CONFIGURATION.md`
-- 实施/阶段说明：`docs/IMPLEMENTATION.md`
-- 生产部署与运维：`docs/DEPLOYMENT.md`
-- 安全与证书：`docs/SECURITY.md`
-- 运维与排障：`docs/OPERATIONS.md`
+| 主题 | 入口 |
+|------|------|
+| 架构与时序图 | `ARCHITECTURE.md` |
+| 协议说明 | `docs/PROTOCOL.md` |
+| 配置说明 | `docs/CONFIGURATION.md` |
+| 实施/阶段说明 | `docs/IMPLEMENTATION.md` |
+| 生产部署与运维 | `docs/DEPLOYMENT.md` |
+| 安全与证书 | `docs/SECURITY.md` |
+| 运维与排障 | `docs/OPERATIONS.md` |
 
-## 快速开始
+## 适合 / 不适合
 
-### 构建依赖
+**适合：**
+- 需要多路复用、避免队头阻塞的内网穿透
+- 频繁切换网络（移动网络）或需要连接迁移
+- 对握手延迟敏感，期望 0-RTT 重连
 
-在编译 quichole 之前，需要安装以下依赖：
+**不适合：**
+- UDP 被严格屏蔽的网络环境
+- 只能接受 TCP 转发的封闭网络
 
-**Linux (Arch/Manjaro):**
-```bash
-sudo pacman -S cmake
-```
+## 生产就绪声明
 
-**Linux (Debian/Ubuntu):**
-```bash
-sudo apt install cmake build-essential
-```
-
-**macOS:**
-```bash
-brew install cmake
-```
-
-**Windows:**
-- 安装 [CMake](https://cmake.org/download/)
-- 安装 [Visual Studio Build Tools](https://visualstudio.microsoft.com/downloads/)
-
-> **注意**: quiche 依赖 BoringSSL，需要 cmake 来编译。
-
-### 从源码安装
-
-```bash
-git clone https://github.com/yourusername/quichole.git
-cd quichole
-cargo build --release
-```
-
-安装到系统：
-```bash
-cargo install --path ./svr  # 安装服务端
-cargo install --path ./cli  # 安装客户端
-```
-
-### 服务端配置
-
-创建 `server.toml`:
-
-```toml
-bind_addr = "0.0.0.0:4433"
-
-[tls]
-cert = "certs/server.pem"
-key = "certs/server.key"
-# ca = "certs/ca.pem"
-# require_client_cert = true
-
-[services.my_ssh]
-token = "your_secret_token"
-bind_addr = "0.0.0.0:2222"
-```
-
-生成自签证书（开发环境，注意 SAN 要匹配 `server_name`）：
-
-```bash
-mkdir -p certs
-openssl req -x509 -newkey rsa:2048 -nodes \
-  -keyout certs/server.key \
-  -out certs/server.pem \
-  -days 365 \
-  -subj "/CN=your-server.com" \
-  -addext "subjectAltName=DNS:your-server.com"
-```
-
-运行服务端:
-
-```bash
-quichole-server -c server.toml
-```
-
-### 客户端配置
-
-创建 `client.toml`:
-
-```toml
-remote_addr = "your-server.com:4433"
-
-[tls]
-server_name = "your-server.com"
-# ca = "certs/ca.pem"
-# verify_peer = true
-# cert = "certs/client.pem"
-# key = "certs/client.key"
-
-[services.my_ssh]
-token = "your_secret_token"
-local_addr = "127.0.0.1:22"
-```
-
-运行客户端:
-
-```bash
-quichole-client -c client.toml
-```
-
-现在你可以通过 `your-server.com:2222` 访问内网的 SSH 服务了！
-
-> 若需私有 CA / mTLS：服务端配置 `tls.ca` + `require_client_cert = true`，客户端配置 `tls.ca` + `tls.cert` + `tls.key` 并设置 `tls.verify_peer = true`。
+- 当前为早期开发阶段，已具备 MVP 与端到端测试
+- 建议生产使用前进行小规模灰度与压测
+- 生产部署与运维细节见 `docs/DEPLOYMENT.md`
 
 ## 与 rathole 的对比
 
@@ -165,6 +150,24 @@ quichole-client -c client.toml
 - [x] 端到端测试（QUIC TCP + mTLS）
 - [ ] 更丰富的集成测试
 - [ ] 文档完善（持续更新）
+
+## FAQ
+
+- 连接失败：检查 UDP 入站、防火墙与安全组
+- 证书校验失败：确认 `server_name` 与证书 SAN 匹配
+- 服务不可达：检查 `bind_addr`/`local_addr` 是否正确
+- 频繁重连：调节心跳参数，检查网络抖动
+- mTLS 失败：确认 `tls.ca`、`tls.cert`、`tls.key` 是否齐全
+
+## 路线图（简版）
+
+- 集成测试覆盖更多异常场景
+- 运维/观测能力增强（日志/指标）
+- 性能基准与压测报告
+
+## 贡献
+
+欢迎提交 issue 或 PR。建议附带复现步骤、日志与配置片段。
 
 ## 许可证
 
