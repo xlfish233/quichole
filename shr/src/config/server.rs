@@ -3,7 +3,7 @@ use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use super::{ServiceType, TlsConfig};
+use super::{LoggingConfig, ServiceType, TlsConfig};
 
 /// 服务端配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,6 +30,10 @@ pub struct ServerConfig {
     /// TLS 配置
     #[serde(default)]
     pub tls: TlsConfig,
+
+    /// 日志配置
+    #[serde(default)]
+    pub logging: LoggingConfig,
 
     /// 服务列表
     pub services: HashMap<String, ServerServiceConfig>,
