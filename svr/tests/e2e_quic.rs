@@ -5,6 +5,7 @@ use quichole_cli::runtime::{run_client, run_client_with_shutdown};
 use quichole_shr::config::{
     ClientConfig, ClientServiceConfig, ServerConfig, ServerServiceConfig, ServiceType, TlsConfig,
 };
+use quichole_shr::logging::ShutdownSignal;
 use quichole_svr::runtime::run_server;
 use quichole_svr::server::ServerState;
 use rcgen::{CertificateParams, KeyPair};
@@ -15,7 +16,6 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::oneshot;
 use tokio::time::{sleep, timeout, Duration};
 
 struct EnvGuard {
@@ -159,6 +159,7 @@ async fn test_quic_tcp_forward_end_to_end() -> Result<()> {
                 service_type: ServiceType::Tcp,
             },
         )]),
+        logging: Default::default(),
     };
 
     let client_config = ClientConfig {
@@ -180,13 +181,16 @@ async fn test_quic_tcp_forward_end_to_end() -> Result<()> {
                 retry_interval: None,
             },
         )]),
+        logging: Default::default(),
     };
 
     let server_state = ServerState::from_config(server_config).context("build server state")?;
     let client_state = ClientState::from_config(client_config).context("build client state")?;
 
-    let server_handle = tokio::spawn(async move { run_server(server_state).await });
-    let client_handle = tokio::spawn(async move { run_client(client_state).await });
+    let server_shutdown = ShutdownSignal::new();
+    let server_handle = tokio::spawn(async move { run_server(server_state, server_shutdown).await });
+    let client_shutdown = ShutdownSignal::new();
+    let client_handle = tokio::spawn(async move { run_client(client_state, client_shutdown).await });
 
     let service_addr = format!("127.0.0.1:{service_port}");
     let payload = b"quichole-e2e";
@@ -254,6 +258,7 @@ async fn test_service_stops_after_control_channel_close() -> Result<()> {
                 service_type: ServiceType::Tcp,
             },
         )]),
+        logging: Default::default(),
     };
 
     let client_config = ClientConfig {
@@ -275,15 +280,18 @@ async fn test_service_stops_after_control_channel_close() -> Result<()> {
                 retry_interval: None,
             },
         )]),
+        logging: Default::default(),
     };
 
     let server_state = ServerState::from_config(server_config).context("build server state")?;
     let client_state = ClientState::from_config(client_config).context("build client state")?;
 
-    let server_handle = tokio::spawn(async move { run_server(server_state).await });
-    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server_shutdown = ShutdownSignal::new();
+    let server_handle = tokio::spawn(async move { run_server(server_state, server_shutdown).await });
+    let client_shutdown = ShutdownSignal::new();
+    let client_shutdown_trigger = client_shutdown.clone();
     let client_handle =
-        tokio::spawn(async move { run_client_with_shutdown(client_state, shutdown_rx).await });
+        tokio::spawn(async move { run_client_with_shutdown(client_state, client_shutdown).await });
 
     let service_addr = format!("127.0.0.1:{service_port}");
     let payload = b"quichole-stop";
@@ -307,7 +315,7 @@ async fn test_service_stops_after_control_channel_close() -> Result<()> {
 
     assert_eq!(result.as_slice(), payload);
 
-    let _ = shutdown_tx.send(());
+    let _ = client_shutdown_trigger.shutdown();
     client_handle.abort();
     let _ = client_handle.await;
     sleep(Duration::from_secs(3)).await;
@@ -355,6 +363,7 @@ async fn test_service_rebinds_after_client_reconnect() -> Result<()> {
                 service_type: ServiceType::Tcp,
             },
         )]),
+        logging: Default::default(),
     };
 
     let base_client_config = ClientConfig {
@@ -376,15 +385,18 @@ async fn test_service_rebinds_after_client_reconnect() -> Result<()> {
                 retry_interval: None,
             },
         )]),
+        logging: Default::default(),
     };
 
     let server_state = ServerState::from_config(server_config).context("build server state")?;
-    let server_handle = tokio::spawn(async move { run_server(server_state).await });
+    let server_shutdown = ShutdownSignal::new();
+    let server_handle = tokio::spawn(async move { run_server(server_state, server_shutdown).await });
 
     let client_state = ClientState::from_config(base_client_config.clone()).context("build client")?;
-    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let client_shutdown = ShutdownSignal::new();
+    let client_shutdown_trigger = client_shutdown.clone();
     let client_handle =
-        tokio::spawn(async move { run_client_with_shutdown(client_state, shutdown_rx).await });
+        tokio::spawn(async move { run_client_with_shutdown(client_state, client_shutdown).await });
 
     let service_addr = format!("127.0.0.1:{service_port}");
     let payload = b"quichole-reconnect";
@@ -407,16 +419,17 @@ async fn test_service_rebinds_after_client_reconnect() -> Result<()> {
 
     assert_eq!(first_round.as_slice(), payload);
 
-    let _ = shutdown_tx.send(());
+    let _ = client_shutdown_trigger.shutdown();
     client_handle.abort();
     let _ = client_handle.await;
     sleep(Duration::from_secs(3)).await;
     wait_for_port_close(&service_addr, 10).await?;
 
     let client_state = ClientState::from_config(base_client_config).context("build client")?;
-    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let client_shutdown = ShutdownSignal::new();
+    let client_shutdown_trigger = client_shutdown.clone();
     let client_handle =
-        tokio::spawn(async move { run_client_with_shutdown(client_state, shutdown_rx).await });
+        tokio::spawn(async move { run_client_with_shutdown(client_state, client_shutdown).await });
 
     let second_round = timeout(Duration::from_secs(20), async {
         let mut stream = loop {
@@ -436,7 +449,7 @@ async fn test_service_rebinds_after_client_reconnect() -> Result<()> {
 
     assert_eq!(second_round.as_slice(), payload);
 
-    let _ = shutdown_tx.send(());
+    let _ = client_shutdown_trigger.shutdown();
     client_handle.abort();
     server_handle.abort();
     echo_handle.abort();

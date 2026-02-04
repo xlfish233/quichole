@@ -18,6 +18,7 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use quichole_shr::logging::ShutdownSignal;
 use tokio::time::{sleep, timeout, Duration};
 
 fn temp_path(prefix: &str, suffix: &str) -> PathBuf {
@@ -184,6 +185,7 @@ async fn test_quic_tcp_forward_mtls_end_to_end() -> Result<()> {
                 service_type: ServiceType::Tcp,
             },
         )]),
+        logging: Default::default(),
     };
 
     let client_config = ClientConfig {
@@ -209,13 +211,16 @@ async fn test_quic_tcp_forward_mtls_end_to_end() -> Result<()> {
                 retry_interval: None,
             },
         )]),
+        logging: Default::default(),
     };
 
     let server_state = ServerState::from_config(server_config).context("build server state")?;
     let client_state = ClientState::from_config(client_config).context("build client state")?;
 
-    let server_handle = tokio::spawn(async move { run_server(server_state).await });
-    let client_handle = tokio::spawn(async move { run_client(client_state).await });
+    let server_shutdown = ShutdownSignal::new();
+    let server_handle = tokio::spawn(async move { run_server(server_state, server_shutdown).await });
+    let client_shutdown = ShutdownSignal::new();
+    let client_handle = tokio::spawn(async move { run_client(client_state, client_shutdown).await });
 
     let service_addr = format!("127.0.0.1:{service_port}");
     let payload = b"quichole-mtls-e2e";
