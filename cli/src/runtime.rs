@@ -27,10 +27,7 @@ pub async fn run_client(client: ClientState, shutdown: ShutdownSignal) -> Result
     run_client_with_shutdown(client, shutdown).await
 }
 
-pub async fn run_client_with_shutdown(
-    client: ClientState,
-    shutdown: ShutdownSignal,
-) -> Result<()> {
+pub async fn run_client_with_shutdown(client: ClientState, shutdown: ShutdownSignal) -> Result<()> {
     let client = Arc::new(client);
     let mut join_set = JoinSet::new();
     let mut shutdown_rx = shutdown.subscribe();
@@ -49,8 +46,15 @@ pub async fn run_client_with_shutdown(
         let service_shutdown = shutdown.clone();
 
         join_set.spawn(async move {
-            if let Err(err) =
-                run_service_with_shutdown(remote_addr, tls, service, retry, quic_idle_timeout_ms, service_shutdown).await
+            if let Err(err) = run_service_with_shutdown(
+                remote_addr,
+                tls,
+                service,
+                retry,
+                quic_idle_timeout_ms,
+                service_shutdown,
+            )
+            .await
             {
                 tracing::warn!(error = %err, "client service stopped");
             }
@@ -473,7 +477,11 @@ where
     T: Serialize,
 {
     let frame = encode_message(msg)?;
-    tracing::debug!(stream_id = stream.id(), len = frame.len(), "sending framed message");
+    tracing::debug!(
+        stream_id = stream.id(),
+        len = frame.len(),
+        "sending framed message"
+    );
     stream.send(Bytes::from(frame)).await
 }
 
@@ -484,7 +492,10 @@ where
     tracing::debug!(stream_id = stream.id(), "recv_framed: starting");
     loop {
         if let Some(result) = decoder.decode_next::<T>() {
-            tracing::debug!(stream_id = stream.id(), "received framed message from decoder cache");
+            tracing::debug!(
+                stream_id = stream.id(),
+                "received framed message from decoder cache"
+            );
             return result;
         }
         tracing::trace!(stream_id = stream.id(), "recv_framed: waiting for chunk");
@@ -492,7 +503,12 @@ where
             .recv()
             .await
             .ok_or_else(|| anyhow!("quic stream closed"))?;
-        tracing::debug!(stream_id = stream.id(), bytes = chunk.data.len(), fin = chunk.fin, "recv_framed: received chunk");
+        tracing::debug!(
+            stream_id = stream.id(),
+            bytes = chunk.data.len(),
+            fin = chunk.fin,
+            "recv_framed: received chunk"
+        );
         decoder.push(&chunk.data);
         if chunk.fin {
             if let Some(result) = decoder.decode_next::<T>() {

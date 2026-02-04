@@ -12,19 +12,13 @@ use tracing_subscriber::Registry;
 /// restarting the application. It can be used with environment
 /// variables or configuration files.
 pub struct ReloadHandle {
-    handle: tracing_subscriber::reload::Handle<
-        tracing_subscriber::EnvFilter,
-        Registry
-    >,
+    handle: tracing_subscriber::reload::Handle<tracing_subscriber::EnvFilter, Registry>,
 }
 
 impl ReloadHandle {
     /// Create a new reload handle from the underlying subscriber handle.
     pub fn new(
-        handle: tracing_subscriber::reload::Handle<
-            tracing_subscriber::EnvFilter,
-            Registry
-        >,
+        handle: tracing_subscriber::reload::Handle<tracing_subscriber::EnvFilter, Registry>,
     ) -> Self {
         Self { handle }
     }
@@ -52,8 +46,7 @@ impl ReloadHandle {
     ///
     /// If RUST_LOG is not set, defaults to "info".
     pub fn reload_from_env(&self) -> Result<()> {
-        let directive = std::env::var("RUST_LOG")
-            .unwrap_or_else(|_| "info".to_string());
+        let directive = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
         self.reload(&directive)
     }
 

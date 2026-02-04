@@ -86,7 +86,11 @@ impl QuicStreamSender {
     }
 
     pub async fn send(&self, data: Bytes) -> Result<()> {
-        tracing::trace!(stream_id = self.id, len = data.len(), "QuicStreamSender::send");
+        tracing::trace!(
+            stream_id = self.id,
+            len = data.len(),
+            "QuicStreamSender::send"
+        );
         self.outbound
             .send(StreamChunk { data, fin: false })
             .await
@@ -258,7 +262,12 @@ impl QuicApp {
         let mut enqueued = 0;
         for (stream_id, state) in self.streams.iter_mut() {
             while let Ok(chunk) = state.outbound.try_recv() {
-                tracing::trace!(stream_id, data_len = chunk.data.len(), fin = chunk.fin, "enqueuing chunk");
+                tracing::trace!(
+                    stream_id,
+                    data_len = chunk.data.len(),
+                    fin = chunk.fin,
+                    "enqueuing chunk"
+                );
                 state.pending.push_back(chunk);
                 enqueued += 1;
             }
@@ -274,7 +283,12 @@ impl QuicApp {
 
         for (&stream_id, state) in self.streams.iter_mut() {
             while let Some(mut chunk) = state.pending.pop_front() {
-                tracing::trace!(stream_id, data_len = chunk.data.len(), fin = chunk.fin, "attempting to send chunk");
+                tracing::trace!(
+                    stream_id,
+                    data_len = chunk.data.len(),
+                    fin = chunk.fin,
+                    "attempting to send chunk"
+                );
                 if chunk.fin && !chunk.data.is_empty() {
                     state.pending.push_front(StreamChunk {
                         data: Bytes::new(),
@@ -295,7 +309,11 @@ impl QuicApp {
                         total_sent += sent;
                         if !chunk.data.is_empty() && sent < chunk.data.len() {
                             let remaining = chunk.data.slice(sent..);
-                            tracing::debug!(stream_id, remaining = remaining.len(), "partial send, requeueing");
+                            tracing::debug!(
+                                stream_id,
+                                remaining = remaining.len(),
+                                "partial send, requeueing"
+                            );
                             state.pending.push_front(StreamChunk {
                                 data: remaining,
                                 fin: false,
@@ -358,7 +376,7 @@ impl ApplicationOverQuic for QuicApp {
             streams = ?readable_streams,
             "processing readable streams"
         );
-        
+
         for stream_id in readable_streams {
             if self.seen_streams.contains(&stream_id) && !self.streams.contains_key(&stream_id) {
                 tracing::warn!(stream_id, "dropping data for reused stream id");
@@ -402,7 +420,11 @@ impl ApplicationOverQuic for QuicApp {
                             fin,
                         };
                         if let Err(e) = state.inbound.send(chunk) {
-                            tracing::error!(stream_id, "failed to send to inbound channel: {:?}", e);
+                            tracing::error!(
+                                stream_id,
+                                "failed to send to inbound channel: {:?}",
+                                e
+                            );
                         }
                         if fin {
                             break;
@@ -425,7 +447,10 @@ impl ApplicationOverQuic for QuicApp {
         self.drain_commands();
         tracing::trace!("process_writes: enqueuing outbound");
         self.enqueue_outbound();
-        tracing::trace!(pending_streams = self.streams.len(), "process_writes: sending pending");
+        tracing::trace!(
+            pending_streams = self.streams.len(),
+            "process_writes: sending pending"
+        );
         self.send_pending(qconn)
     }
 

@@ -27,7 +27,7 @@ pub mod redaction;
 pub mod reload;
 
 pub use correlation::{ConnectionId, StreamId};
-pub use redaction::{RedactedNonce, RedactedSessionKey, RedactedAuthDigest, redact_bytes_32};
+pub use redaction::{redact_bytes_32, RedactedAuthDigest, RedactedNonce, RedactedSessionKey};
 pub use reload::ReloadHandle;
 
 use anyhow::{Context, Result};
@@ -75,8 +75,7 @@ pub fn init_minimal_logging() -> Option<WorkerGuard> {
         return None;
     }
 
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     let (non_blocking, guard) = tracing_appender::non_blocking(io::stdout());
 
@@ -135,8 +134,9 @@ fn build_subscriber_inline(
             };
 
             let log_dir = &config.file.directory;
-            fs::create_dir_all(log_dir)
-                .with_context(|| format!("failed to create log directory: {}", log_dir.display()))?;
+            fs::create_dir_all(log_dir).with_context(|| {
+                format!("failed to create log directory: {}", log_dir.display())
+            })?;
 
             let rotation = match config.file.rotation_interval {
                 crate::config::RotationInterval::Hourly => Rotation::HOURLY,
@@ -144,7 +144,8 @@ fn build_subscriber_inline(
                 crate::config::RotationInterval::Never => Rotation::NEVER,
             };
 
-            let file_appender = RollingFileAppender::new(rotation.clone(), log_dir, &config.file.prefix);
+            let file_appender =
+                RollingFileAppender::new(rotation.clone(), log_dir, &config.file.prefix);
             let (file_non_blocking, file_guard) = tracing_appender::non_blocking(file_appender);
 
             guards.push(Some(console_guard));
@@ -178,7 +179,8 @@ fn build_subscriber_inline(
             if config.file.separate_error_log {
                 let error_prefix = format!("{}-error", config.file.prefix);
                 let error_appender = RollingFileAppender::new(rotation, log_dir, &error_prefix);
-                let (error_non_blocking, error_guard) = tracing_appender::non_blocking(error_appender);
+                let (error_non_blocking, error_guard) =
+                    tracing_appender::non_blocking(error_appender);
                 guards.push(Some(error_guard));
 
                 let error_layer = fmt::layer()
@@ -234,8 +236,9 @@ fn build_subscriber_inline(
         (false, true) => {
             // Only file
             let log_dir = &config.file.directory;
-            fs::create_dir_all(log_dir)
-                .with_context(|| format!("failed to create log directory: {}", log_dir.display()))?;
+            fs::create_dir_all(log_dir).with_context(|| {
+                format!("failed to create log directory: {}", log_dir.display())
+            })?;
 
             let rotation = match config.file.rotation_interval {
                 crate::config::RotationInterval::Hourly => Rotation::HOURLY,
@@ -243,7 +246,8 @@ fn build_subscriber_inline(
                 crate::config::RotationInterval::Never => Rotation::NEVER,
             };
 
-            let file_appender = RollingFileAppender::new(rotation.clone(), log_dir, &config.file.prefix);
+            let file_appender =
+                RollingFileAppender::new(rotation.clone(), log_dir, &config.file.prefix);
             let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
             guards.push(Some(guard));
 
@@ -257,7 +261,8 @@ fn build_subscriber_inline(
             if config.file.separate_error_log {
                 let error_prefix = format!("{}-error", config.file.prefix);
                 let error_appender = RollingFileAppender::new(rotation, log_dir, &error_prefix);
-                let (error_non_blocking, error_guard) = tracing_appender::non_blocking(error_appender);
+                let (error_non_blocking, error_guard) =
+                    tracing_appender::non_blocking(error_appender);
                 guards.push(Some(error_guard));
 
                 let error_layer = fmt::layer()
@@ -272,7 +277,9 @@ fn build_subscriber_inline(
                         .with(error_layer),
                 ))
             } else {
-                Ok(Box::new(Registry::default().with(filter_layer).with(file_layer)))
+                Ok(Box::new(
+                    Registry::default().with(filter_layer).with(file_layer),
+                ))
             }
         }
         (false, false) => {
@@ -284,12 +291,13 @@ fn build_subscriber_inline(
 
 fn build_env_filter(config: &LoggingConfig) -> Result<EnvFilter> {
     let filter = if let Ok(rust_log) = std::env::var("RUST_LOG") {
-        let mut filter = EnvFilter::try_new(rust_log)
-            .context("invalid RUST_LOG format")?;
+        let mut filter = EnvFilter::try_new(rust_log).context("invalid RUST_LOG format")?;
 
         if !config.filters.overrides.is_empty() {
             filter = filter.add_directive(
-                config.filters.overrides
+                config
+                    .filters
+                    .overrides
                     .parse()
                     .context("invalid filter overrides in config")?,
             );

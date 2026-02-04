@@ -113,19 +113,14 @@ impl Default for LoggingConfig {
 }
 
 /// Log output format.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum LogFormat {
     /// Human-readable pretty format with ANSI colors
+    #[default]
     Pretty,
     /// Machine-parseable JSON format
     Json,
-}
-
-impl Default for LogFormat {
-    fn default() -> Self {
-        Self::Pretty
-    }
 }
 
 /// Console output configuration.
@@ -208,21 +203,16 @@ impl Default for FileConfig {
 }
 
 /// Time-based log rotation interval.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum RotationInterval {
     /// Rotate logs hourly
     Hourly,
     /// Rotate logs daily
+    #[default]
     Daily,
     /// Never rotate based on time
     Never,
-}
-
-impl Default for RotationInterval {
-    fn default() -> Self {
-        Self::Daily
-    }
 }
 
 /// Per-module log filtering configuration.
@@ -309,19 +299,14 @@ impl Default for AsyncConfig {
 }
 
 /// Backpressure behavior when the log buffer is full.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum BackpressureBehavior {
     /// Block until buffer space is available (prevents log loss)
+    #[default]
     Block,
     /// Drop log lines when buffer is full (prevents blocking)
     Drop,
-}
-
-impl Default for BackpressureBehavior {
-    fn default() -> Self {
-        Self::Block
-    }
 }
 
 // ============================================================================
@@ -513,7 +498,10 @@ mod tests {
         assert_eq!(config.metrics.interval_seconds, 30);
         assert!(config.metrics.include_memory_stats);
         assert_eq!(config.r#async.buffer_size, 2048);
-        assert_eq!(config.r#async.backpressure_behavior, BackpressureBehavior::Drop);
+        assert_eq!(
+            config.r#async.backpressure_behavior,
+            BackpressureBehavior::Drop
+        );
 
         // Validate the config
         assert!(config.validate().is_ok());

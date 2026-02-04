@@ -17,9 +17,8 @@ impl ConnectionId {
         // This creates a UUID where the first 8 bytes are the u64 value
         let bytes = id.to_be_bytes();
         let uuid = Uuid::from_bytes([
-            bytes[0], bytes[1], bytes[2], bytes[3],
-            bytes[4], bytes[5], bytes[6], bytes[7],
-            0, 0, 0, 0, 0, 0, 0, 0,
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7], 0, 0,
+            0, 0, 0, 0, 0, 0,
         ]);
         Self(uuid)
     }

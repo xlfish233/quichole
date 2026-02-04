@@ -126,10 +126,7 @@ pub fn begin_control_handshake(server: &ServerState, hello: &Hello) -> Result<Co
         "server generated nonce for handshake"
     );
 
-    Ok(ControlHandshake {
-        service,
-        nonce,
-    })
+    Ok(ControlHandshake { service, nonce })
 }
 
 #[cfg(test)]

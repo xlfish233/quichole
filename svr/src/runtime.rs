@@ -15,8 +15,8 @@ use quichole_shr::quic::{
 use serde::{de::DeserializeOwned, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::time::Duration as StdDuration;
 use std::sync::Arc;
+use std::time::Duration as StdDuration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, oneshot};
@@ -245,25 +245,38 @@ where
     let shutdown_for_service = shutdown.clone();
 
     tokio::spawn(async move {
-        if let Err(err) =
-            control_task_with_shutdown(
-                session,
-                control_stream,
-                manager,
-                req_rx,
-                heartbeat_interval,
-                heartbeat_ack_timeout,
-                shutdown_for_control,
-            )
-            .await
+        if let Err(err) = control_task_with_shutdown(
+            session,
+            control_stream,
+            manager,
+            req_rx,
+            heartbeat_interval,
+            heartbeat_ack_timeout,
+            shutdown_for_control,
+        )
+        .await
         {
             tracing::warn!(error = %err, "control task failed");
         }
     });
 
     match service.service_type() {
-        ServiceType::Tcp => run_tcp_service_with_shutdown(service.bind_addr().to_string(), req_tx, shutdown_for_service).await?,
-        ServiceType::Udp => run_udp_service_with_shutdown(service.bind_addr().to_string(), req_tx, shutdown_for_service).await?,
+        ServiceType::Tcp => {
+            run_tcp_service_with_shutdown(
+                service.bind_addr().to_string(),
+                req_tx,
+                shutdown_for_service,
+            )
+            .await?
+        }
+        ServiceType::Udp => {
+            run_udp_service_with_shutdown(
+                service.bind_addr().to_string(),
+                req_tx,
+                shutdown_for_service,
+            )
+            .await?
+        }
     }
 
     Ok(())
@@ -548,14 +561,18 @@ where
     T: Serialize,
 {
     let frame = encode_message(msg)?;
-    tracing::debug!(stream_id = stream.id(), len = frame.len(), "sending framed message");
+    tracing::debug!(
+        stream_id = stream.id(),
+        len = frame.len(),
+        "sending framed message"
+    );
     stream.send(Bytes::from(frame)).await?;
-    
+
     // 确保数据有机会被发送到网络
     for _ in 0..10 {
         tokio::task::yield_now().await;
     }
-    
+
     Ok(())
 }
 
@@ -566,7 +583,10 @@ where
     tracing::debug!(stream_id = stream.id(), "recv_framed: starting");
     loop {
         if let Some(result) = decoder.decode_next::<T>() {
-            tracing::debug!(stream_id = stream.id(), "received framed message from decoder cache");
+            tracing::debug!(
+                stream_id = stream.id(),
+                "received framed message from decoder cache"
+            );
             return result;
         }
         tracing::trace!(stream_id = stream.id(), "recv_framed: waiting for chunk");
@@ -574,7 +594,12 @@ where
             .recv()
             .await
             .ok_or_else(|| anyhow!("quic stream closed"))?;
-        tracing::debug!(stream_id = stream.id(), bytes = chunk.data.len(), fin = chunk.fin, "recv_framed: received chunk");
+        tracing::debug!(
+            stream_id = stream.id(),
+            bytes = chunk.data.len(),
+            fin = chunk.fin,
+            "recv_framed: received chunk"
+        );
         decoder.push(&chunk.data);
         if chunk.fin {
             if let Some(result) = decoder.decode_next::<T>() {

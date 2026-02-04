@@ -44,8 +44,8 @@ async fn wait_for_shutdown_signal() {
 
     #[cfg(unix)]
     let terminate = async {
-        let mut sig_term = unix::signal(SignalKind::terminate())
-            .expect("failed to install SIGTERM handler");
+        let mut sig_term =
+            unix::signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
         sig_term.recv().await;
         tracing::info!("received SIGTERM, initiating shutdown");
     };

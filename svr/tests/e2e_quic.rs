@@ -188,9 +188,11 @@ async fn test_quic_tcp_forward_end_to_end() -> Result<()> {
     let client_state = ClientState::from_config(client_config).context("build client state")?;
 
     let server_shutdown = ShutdownSignal::new();
-    let server_handle = tokio::spawn(async move { run_server(server_state, server_shutdown).await });
+    let server_handle =
+        tokio::spawn(async move { run_server(server_state, server_shutdown).await });
     let client_shutdown = ShutdownSignal::new();
-    let client_handle = tokio::spawn(async move { run_client(client_state, client_shutdown).await });
+    let client_handle =
+        tokio::spawn(async move { run_client(client_state, client_shutdown).await });
 
     let service_addr = format!("127.0.0.1:{service_port}");
     let payload = b"quichole-e2e";
@@ -287,7 +289,8 @@ async fn test_service_stops_after_control_channel_close() -> Result<()> {
     let client_state = ClientState::from_config(client_config).context("build client state")?;
 
     let server_shutdown = ShutdownSignal::new();
-    let server_handle = tokio::spawn(async move { run_server(server_state, server_shutdown).await });
+    let server_handle =
+        tokio::spawn(async move { run_server(server_state, server_shutdown).await });
     let client_shutdown = ShutdownSignal::new();
     let client_shutdown_trigger = client_shutdown.clone();
     let client_handle =
@@ -390,9 +393,11 @@ async fn test_service_rebinds_after_client_reconnect() -> Result<()> {
 
     let server_state = ServerState::from_config(server_config).context("build server state")?;
     let server_shutdown = ShutdownSignal::new();
-    let server_handle = tokio::spawn(async move { run_server(server_state, server_shutdown).await });
+    let server_handle =
+        tokio::spawn(async move { run_server(server_state, server_shutdown).await });
 
-    let client_state = ClientState::from_config(base_client_config.clone()).context("build client")?;
+    let client_state =
+        ClientState::from_config(base_client_config.clone()).context("build client")?;
     let client_shutdown = ShutdownSignal::new();
     let client_shutdown_trigger = client_shutdown.clone();
     let client_handle =
