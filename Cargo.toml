@@ -17,12 +17,16 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 anyhow = "1"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "registry", "ansi"] }
+tracing-appender = "0.2"
 clap = { version = "4", features = ["derive"] }
 ring = "0.17"
 bytes = { version = "1", features = ["serde"] }
 futures-util = "0.3"
 boring = "4.3"
+regex = "1.10"
+once_cell = "1.19"
+uuid = { version = "1.10", features = ["v4"] }
 
 [profile.release]
 lto = true
