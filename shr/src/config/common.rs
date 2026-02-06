@@ -34,6 +34,24 @@ pub struct TlsConfig {
     pub require_client_cert: bool,
 }
 
+/// 客户端证书与私钥对
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientCertKeyPair {
+    /// 客户端证书路径（PEM）
+    pub cert: String,
+    /// 客户端私钥路径（PEM）
+    pub key: String,
+}
+
+/// 客户端 TLS 参数
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientTlsParams {
+    /// 客户端证书与私钥（mTLS 场景）
+    pub cert_key: Option<ClientCertKeyPair>,
+    /// CA 证书路径（用于验证服务端证书）
+    pub ca: Option<String>,
+}
+
 impl TlsConfig {
     /// 验证服务端 TLS 配置
     ///
@@ -107,12 +125,15 @@ impl TlsConfig {
     ///
     /// # 返回值
     /// (cert_key_pair, ca)
-    pub fn client_params(&self) -> Result<(Option<(String, String)>, Option<String>)> {
+    pub fn client_params(&self) -> Result<ClientTlsParams> {
         self.validate_client()?;
 
         let cert_key = if let (Some(cert), Some(key)) = (&self.cert, &self.key) {
             if !cert.is_empty() && !key.is_empty() {
-                Some((cert.clone(), key.clone()))
+                Some(ClientCertKeyPair {
+                    cert: cert.clone(),
+                    key: key.clone(),
+                })
             } else {
                 None
             }
@@ -126,7 +147,7 @@ impl TlsConfig {
             .filter(|v| !v.is_empty())
             .map(str::to_string);
 
-        Ok((cert_key, ca))
+        Ok(ClientTlsParams { cert_key, ca })
     }
 }
 
@@ -171,5 +192,56 @@ mod tests {
 
         assert_eq!(tcp.ty, ServiceType::Tcp);
         assert_eq!(udp.ty, ServiceType::Udp);
+    }
+
+    #[test]
+    fn test_client_params_empty() {
+        let tls = TlsConfig::default();
+        let params = tls.client_params().unwrap();
+
+        assert!(params.cert_key.is_none());
+        assert!(params.ca.is_none());
+    }
+
+    #[test]
+    fn test_client_params_with_cert_key() {
+        let tls = TlsConfig {
+            cert: Some("client.pem".to_string()),
+            key: Some("client.key".to_string()),
+            ..TlsConfig::default()
+        };
+
+        let params = tls.client_params().unwrap();
+        assert_eq!(
+            params.cert_key,
+            Some(ClientCertKeyPair {
+                cert: "client.pem".to_string(),
+                key: "client.key".to_string(),
+            })
+        );
+        assert!(params.ca.is_none());
+    }
+
+    #[test]
+    fn test_client_params_requires_cert_key_when_ca_set() {
+        let tls = TlsConfig {
+            ca: Some("ca.pem".to_string()),
+            ..TlsConfig::default()
+        };
+
+        let err = tls.client_params().unwrap_err();
+        assert!(err.to_string().contains("tls.ca requires"));
+    }
+
+    #[test]
+    fn test_client_params_empty_cert_key_treated_as_none() {
+        let tls = TlsConfig {
+            cert: Some(String::new()),
+            key: Some(String::new()),
+            ..TlsConfig::default()
+        };
+
+        let params = tls.client_params().unwrap();
+        assert!(params.cert_key.is_none());
     }
 }

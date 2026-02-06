@@ -113,7 +113,7 @@ async fn run_service_once(
     service: &ClientService,
     quic_idle_timeout_ms: Option<u64>,
 ) -> Result<()> {
-    let (tls_cert_key, ca) = tls.client_params()?;
+    let tls_params = tls.client_params()?;
     let remote = resolve_remote_addr(remote_addr).await?;
     let server_name = tls
         .server_name
@@ -125,11 +125,12 @@ async fn run_service_once(
     udp.connect(remote).await?;
     let socket: Socket<Arc<UdpSocket>, Arc<UdpSocket>> =
         Socket::<Arc<UdpSocket>, Arc<UdpSocket>>::from_udp(udp)?;
-    let tls_cert = tls_cert_key
+    let tls_cert = tls_params
+        .cert_key
         .as_ref()
-        .map(|(cert, key)| TlsCertificatePaths {
-            cert,
-            private_key: key,
+        .map(|pair| TlsCertificatePaths {
+            cert: &pair.cert,
+            private_key: &pair.key,
             kind: CertificateKind::X509,
         });
     let mut settings = QuicSettings::default();
@@ -138,7 +139,7 @@ async fn run_service_once(
     }
     settings.verify_peer = tls.verify_peer;
 
-    let hooks = build_client_tls_hooks(ca, tls.verify_peer)?;
+    let hooks = build_client_tls_hooks(tls_params.ca, tls.verify_peer)?;
     let params = ConnectionParams::new_client(settings, tls_cert, hooks);
 
     let (app, handle) = QuicApp::new(quichole_shr::quic::CONTROL_STREAM_ID);
