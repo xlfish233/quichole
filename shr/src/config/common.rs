@@ -1,4 +1,5 @@
 // 通用配置类型
+use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 
 /// 服务类型
@@ -31,6 +32,102 @@ pub struct TlsConfig {
     /// 是否要求客户端证书（服务端）
     #[serde(default)]
     pub require_client_cert: bool,
+}
+
+impl TlsConfig {
+    /// 验证服务端 TLS 配置
+    ///
+    /// # 错误
+    /// - 如果 cert 或 key 未设置，返回错误
+    /// - 如果要求客户端证书但未设置 CA，返回错误
+    pub fn validate_server(&self) -> Result<()> {
+        let cert = self.cert.as_deref().filter(|v| !v.is_empty());
+        let key = self.key.as_deref().filter(|v| !v.is_empty());
+
+        if cert.is_none() {
+            bail!("tls.cert is required for server");
+        }
+        if key.is_none() {
+            bail!("tls.key is required for server");
+        }
+
+        // 如果要求客户端证书，必须提供 CA
+        if self.require_client_cert {
+            let ca = self.ca.as_deref().filter(|v| !v.is_empty());
+            if ca.is_none() {
+                bail!("tls.ca is required when require_client_cert = true");
+            }
+        }
+
+        Ok(())
+    }
+
+    /// 验证客户端 TLS 配置
+    ///
+    /// # 错误
+    /// - 如果 cert 和 key 未成对出现，返回错误
+    /// - 如果设置了 CA 但未设置 cert 和 key，返回错误
+    pub fn validate_client(&self) -> Result<()> {
+        let cert = self.cert.as_deref().filter(|v| !v.is_empty());
+        let key = self.key.as_deref().filter(|v| !v.is_empty());
+        let ca = self.ca.as_deref().filter(|v| !v.is_empty());
+
+        // cert 和 key 必须成对出现
+        if cert.is_some() ^ key.is_some() {
+            bail!("tls.cert and tls.key must be set together");
+        }
+
+        // 如果设置了 CA（用于 mTLS），必须提供证书和密钥
+        if ca.is_some() && cert.is_none() {
+            bail!("tls.ca requires tls.cert and tls.key for client mTLS");
+        }
+
+        Ok(())
+    }
+
+    /// 提取服务端配置所需的参数
+    ///
+    /// # 返回值
+    /// (cert, key, ca)
+    pub fn server_params(&self) -> Result<(String, String, Option<String>)> {
+        self.validate_server()?;
+
+        let cert = self.cert.as_ref().unwrap().clone();
+        let key = self.key.as_ref().unwrap().clone();
+        let ca = self
+            .ca
+            .as_deref()
+            .filter(|v| !v.is_empty())
+            .map(str::to_string);
+
+        Ok((cert, key, ca))
+    }
+
+    /// 提取客户端配置所需的参数
+    ///
+    /// # 返回值
+    /// (cert_key_pair, ca)
+    pub fn client_params(&self) -> Result<(Option<(String, String)>, Option<String>)> {
+        self.validate_client()?;
+
+        let cert_key = if let (Some(cert), Some(key)) = (&self.cert, &self.key) {
+            if !cert.is_empty() && !key.is_empty() {
+                Some((cert.clone(), key.clone()))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let ca = self
+            .ca
+            .as_deref()
+            .filter(|v| !v.is_empty())
+            .map(str::to_string);
+
+        Ok((cert_key, ca))
+    }
 }
 
 #[cfg(test)]

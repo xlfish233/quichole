@@ -1,21 +1,21 @@
-use anyhow::{anyhow, bail, Context, Result};
-use boring::ssl::{SslContextBuilder, SslFiletype, SslMethod, SslVerifyMode};
+use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use quichole_shr::config::TlsConfig;
 use quichole_shr::logging::{RedactedNonce, ShutdownSignal};
 use quichole_shr::protocol::{encode_message, FrameDecoder};
 use quichole_shr::protocol::{Ack, ControlChannelCmd, DataChannelCmd, UdpTraffic, PROTO_V1};
-use quichole_shr::quic::{ConnectionRole, QuicApp, QuicConnectionState, QuicStreamHandle};
-use serde::{de::DeserializeOwned, Serialize};
+use quichole_shr::quic::{
+    build_client_tls_hooks, forward_tcp_bidirectional, recv_framed, send_framed, ConnectionRole,
+    QuicApp, QuicConnectionState, QuicStreamHandle,
+};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::task::JoinSet;
 use tokio::time::{sleep, Duration};
-use tokio_quiche::quic::{connect_with_config, ConnectionHook};
-use tokio_quiche::settings::{CertificateKind, Hooks, QuicSettings, TlsCertificatePaths};
+use tokio_quiche::quic::connect_with_config;
+use tokio_quiche::settings::{CertificateKind, QuicSettings, TlsCertificatePaths};
 use tokio_quiche::socket::Socket;
 use tokio_quiche::ConnectionParams;
 
@@ -113,7 +113,7 @@ async fn run_service_once(
     service: &ClientService,
     quic_idle_timeout_ms: Option<u64>,
 ) -> Result<()> {
-    validate_client_tls_config(tls)?;
+    tls.validate_client()?;
     let remote = resolve_remote_addr(remote_addr).await?;
     let server_name = tls
         .server_name
@@ -140,7 +140,14 @@ async fn run_service_once(
         settings.max_idle_timeout = Some(StdDuration::from_millis(timeout_ms));
     }
     settings.verify_peer = tls.verify_peer;
-    let hooks = build_client_hooks(tls, tls_cert.is_some())?;
+
+    // Build TLS hooks - only set CA if client has cert/key for mTLS
+    let ca = if tls_cert.is_some() {
+        tls.ca.as_deref().filter(|val| !val.is_empty()).map(str::to_string)
+    } else {
+        None
+    };
+    let hooks = build_client_tls_hooks(ca, tls.verify_peer)?;
     let params = ConnectionParams::new_client(settings, tls_cert, hooks);
 
     let (app, handle) = QuicApp::new(quichole_shr::quic::CONTROL_STREAM_ID);
@@ -157,7 +164,7 @@ async fn run_service_once(
         return Err(anyhow!("protocol version mismatch"));
     }
 
-    send_framed(&control_stream, &hello).await?;
+    send_framed(&control_stream, &hello, false).await?;
     tracing::debug!("hello sent, waiting for nonce");
     let nonce: [u8; 32] = recv_framed(&mut control_stream, &mut control_decoder).await?;
     tracing::debug!(
@@ -166,7 +173,7 @@ async fn run_service_once(
     );
     let auth = auth_message(service.token(), &nonce);
     tracing::debug!("auth message computed from token and nonce");
-    send_framed(&control_stream, &auth).await?;
+    send_framed(&control_stream, &auth, false).await?;
     tracing::debug!("auth sent, yielding multiple times");
     for _ in 0..5 {
         tokio::task::yield_now().await;
@@ -189,7 +196,7 @@ async fn run_service_once(
             };
         match cmd {
             ControlChannelCmd::Heartbeat => {
-                if let Err(err) = send_framed(&control_stream, &ControlChannelCmd::Heartbeat).await
+                if let Err(err) = send_framed(&control_stream, &ControlChannelCmd::Heartbeat, false).await
                 {
                     tracing::warn!(error = %err, "control channel heartbeat ack failed");
                     return Err(err);
@@ -204,7 +211,7 @@ async fn run_service_once(
                 let mut data_stream = manager.open_stream(stream_id).await?;
                 tracing::debug!(stream_id, "data stream opened");
                 let data_hello = data_channel_hello(session_key);
-                if let Err(err) = send_framed(&data_stream, &data_hello).await {
+                if let Err(err) = send_framed(&data_stream, &data_hello, false).await {
                     tracing::warn!(error = %err, stream_id, "send data channel hello failed");
                     return Err(err);
                 }
@@ -233,7 +240,23 @@ async fn run_service_once(
                 match data_cmd {
                     DataChannelCmd::StartForwardTcp => {
                         tokio::spawn(async move {
-                            if let Err(err) = forward_tcp(&local_addr, data_stream, pending).await {
+                            // Connect to local TCP service first
+                            let socket = match TcpStream::connect(&local_addr).await {
+                                Ok(s) => s,
+                                Err(err) => {
+                                    tracing::warn!(error = %err, local_addr, "failed to connect to local tcp service");
+                                    return;
+                                }
+                            };
+
+                            if let Err(err) = forward_tcp_bidirectional(
+                                socket,
+                                data_stream,
+                                pending,
+                                format!("local={}", local_addr),
+                            )
+                            .await
+                            {
                                 tracing::warn!(error = %err, "tcp forward failed");
                             }
                         });
@@ -249,137 +272,6 @@ async fn run_service_once(
             }
         }
     }
-}
-
-struct ClientTlsHook {
-    ca: Option<String>,
-    verify_peer: bool,
-}
-
-impl ConnectionHook for ClientTlsHook {
-    fn create_custom_ssl_context_builder(
-        &self,
-        settings: TlsCertificatePaths<'_>,
-    ) -> Option<SslContextBuilder> {
-        if settings.kind != CertificateKind::X509 {
-            return None;
-        }
-        let mut builder = SslContextBuilder::new(SslMethod::tls()).ok()?;
-        if let Err(err) = builder.set_certificate_chain_file(settings.cert) {
-            tracing::warn!(error = %err, "failed to load client certificate");
-            return None;
-        }
-        if let Err(err) = builder.set_private_key_file(settings.private_key, SslFiletype::PEM) {
-            tracing::warn!(error = %err, "failed to load client private key");
-            return None;
-        }
-        if let Err(err) = builder.check_private_key() {
-            tracing::warn!(error = %err, "client private key mismatch");
-            return None;
-        }
-        if let Some(ca) = &self.ca {
-            if let Err(err) = builder.set_ca_file(ca) {
-                tracing::warn!(error = %err, "failed to load client CA file");
-                return None;
-            }
-        }
-        if self.verify_peer {
-            builder.set_verify(SslVerifyMode::PEER);
-        }
-        Some(builder)
-    }
-}
-
-fn build_client_hooks(tls: &TlsConfig, has_tls_cert: bool) -> Result<Hooks> {
-    let ca = tls.ca.as_deref().filter(|val| !val.is_empty());
-    if ca.is_none() {
-        return Ok(Hooks::default());
-    }
-    if !has_tls_cert {
-        bail!("tls.ca requires tls.cert and tls.key for client mTLS");
-    }
-    let hook = ClientTlsHook {
-        ca: ca.map(str::to_string),
-        verify_peer: tls.verify_peer,
-    };
-    Ok(Hooks {
-        connection_hook: Some(Arc::new(hook)),
-    })
-}
-
-fn validate_client_tls_config(tls: &TlsConfig) -> Result<()> {
-    let cert = tls.cert.as_deref().filter(|val| !val.is_empty());
-    let key = tls.key.as_deref().filter(|val| !val.is_empty());
-    let ca = tls.ca.as_deref().filter(|val| !val.is_empty());
-    if cert.is_some() ^ key.is_some() {
-        bail!("tls.cert and tls.key must be set together");
-    }
-    if ca.is_some() && cert.is_none() {
-        bail!("tls.ca requires tls.cert and tls.key for client mTLS");
-    }
-    Ok(())
-}
-
-async fn forward_tcp(
-    local_addr: &str,
-    stream: QuicStreamHandle,
-    pending: Option<Bytes>,
-) -> Result<()> {
-    let stream_id = stream.id();
-    tracing::debug!(local_addr, stream_id, "tcp forward start");
-    let socket = TcpStream::connect(local_addr)
-        .await
-        .with_context(|| format!("connect local tcp {}", local_addr))?;
-    let (quic_tx, mut quic_rx) = stream.split();
-    let (mut reader, mut writer) = socket.into_split();
-
-    let to_quic = async {
-        let mut buf = [0u8; 16 * 1024];
-        loop {
-            let n = reader.read(&mut buf).await?;
-            tracing::debug!(local_addr, stream_id, bytes = n, "local->quic read");
-            if n == 0 {
-                quic_tx.send_fin().await?;
-                break;
-            }
-            quic_tx.send(Bytes::copy_from_slice(&buf[..n])).await?;
-            tracing::debug!(local_addr, stream_id, bytes = n, "local->quic sent");
-        }
-        Result::<()>::Ok(())
-    };
-
-    let from_quic = async {
-        if let Some(pending) = pending {
-            tracing::debug!(
-                local_addr,
-                stream_id,
-                bytes = pending.len(),
-                "quic->local pending"
-            );
-            writer.write_all(&pending).await?;
-        }
-        while let Some(chunk) = quic_rx.recv().await {
-            if !chunk.data.is_empty() {
-                tracing::debug!(
-                    local_addr,
-                    stream_id,
-                    bytes = chunk.data.len(),
-                    "quic->local recv"
-                );
-                writer.write_all(&chunk.data).await?;
-            }
-            if chunk.fin {
-                tracing::debug!(local_addr, stream_id, "quic->local fin");
-                writer.shutdown().await?;
-                break;
-            }
-        }
-        Result::<()>::Ok(())
-    };
-
-    tokio::try_join!(to_quic, from_quic)?;
-    tracing::debug!(local_addr, stream_id, "tcp forward finished");
-    Ok(())
 }
 
 async fn forward_udp(
@@ -472,53 +364,6 @@ fn extract_server_name(addr: &str) -> Option<String> {
     addr.rsplit_once(':').map(|(host, _)| host.to_string())
 }
 
-async fn send_framed<T>(stream: &QuicStreamHandle, msg: &T) -> Result<()>
-where
-    T: Serialize,
-{
-    let frame = encode_message(msg)?;
-    tracing::debug!(
-        stream_id = stream.id(),
-        len = frame.len(),
-        "sending framed message"
-    );
-    stream.send(Bytes::from(frame)).await
-}
-
-async fn recv_framed<T>(stream: &mut QuicStreamHandle, decoder: &mut FrameDecoder) -> Result<T>
-where
-    T: DeserializeOwned,
-{
-    tracing::debug!(stream_id = stream.id(), "recv_framed: starting");
-    loop {
-        if let Some(result) = decoder.decode_next::<T>() {
-            tracing::debug!(
-                stream_id = stream.id(),
-                "received framed message from decoder cache"
-            );
-            return result;
-        }
-        tracing::trace!(stream_id = stream.id(), "recv_framed: waiting for chunk");
-        let chunk = stream
-            .recv()
-            .await
-            .ok_or_else(|| anyhow!("quic stream closed"))?;
-        tracing::debug!(
-            stream_id = stream.id(),
-            bytes = chunk.data.len(),
-            fin = chunk.fin,
-            "recv_framed: received chunk"
-        );
-        decoder.push(&chunk.data);
-        if chunk.fin {
-            if let Some(result) = decoder.decode_next::<T>() {
-                return result;
-            }
-            return Err(anyhow!("quic stream finished before message complete"));
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -530,7 +375,7 @@ mod tests {
             ..TlsConfig::default()
         };
 
-        let err = validate_client_tls_config(&tls).unwrap_err();
+        let err = tls.validate_client().unwrap_err();
         assert!(err.to_string().contains("tls.ca requires"));
     }
 
@@ -541,7 +386,7 @@ mod tests {
             ..TlsConfig::default()
         };
 
-        let err = validate_client_tls_config(&tls).unwrap_err();
+        let err = tls.validate_client().unwrap_err();
         assert!(err.to_string().contains("tls.cert and tls.key"));
     }
 }

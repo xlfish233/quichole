@@ -16,6 +16,7 @@ ring.workspace = true
 bytes.workspace = true
 tokio-quiche.workspace = true
 toml.workspace = true
+boring.workspace = true
 bincode = "1.3"
 sha2 = "0.10"
 tracing-appender.workspace = true

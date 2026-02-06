@@ -1,6 +1,4 @@
-use anyhow::{anyhow, bail, Context, Result};
-use boring::ssl::{SslContextBuilder, SslFiletype, SslMethod, SslVerifyMode};
-use boring::x509::X509;
+use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use quichole_shr::config::{ServiceType, TlsConfig};
@@ -10,20 +8,19 @@ use quichole_shr::protocol::{
     Ack, Auth, ControlChannelCmd, DataChannelCmd, Hello, UdpTraffic, PROTO_V1,
 };
 use quichole_shr::quic::{
-    QuicApp, QuicStreamHandle, QuicStreamManager, QuicStreamReceiver, QuicStreamSender,
+    build_server_tls_hooks, forward_tcp_bidirectional, recv_framed, send_framed, QuicApp,
+    QuicStreamHandle, QuicStreamManager, QuicStreamReceiver, QuicStreamSender,
 };
-use serde::{de::DeserializeOwned, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{interval, Duration, Instant, MissedTickBehavior};
 use tokio_quiche::metrics::{DefaultMetrics, Metrics};
-use tokio_quiche::quic::{ConnectionHook, SimpleConnectionIdGenerator};
-use tokio_quiche::settings::{CertificateKind, Hooks, QuicSettings, TlsCertificatePaths};
+use tokio_quiche::quic::SimpleConnectionIdGenerator;
+use tokio_quiche::settings::{CertificateKind, QuicSettings, TlsCertificatePaths};
 use tokio_quiche::{listen, ConnectionParams};
 
 use crate::handshake::begin_control_handshake;
@@ -86,30 +83,24 @@ pub async fn run_server(server: ServerState, shutdown: ShutdownSignal) -> Result
 }
 
 fn build_server_params(tls: &TlsConfig) -> Result<ConnectionParams<'_>> {
-    let cert = tls
-        .cert
-        .as_deref()
-        .filter(|val| !val.is_empty())
-        .ok_or_else(|| anyhow!("tls.cert is required for server"))?;
-    let key = tls
-        .key
-        .as_deref()
-        .filter(|val| !val.is_empty())
-        .ok_or_else(|| anyhow!("tls.key is required for server"))?;
+    // Validate configuration
+    tls.validate_server()?;
+
+    // Extract parameters - using as_deref() to keep them as &str in this scope
+    let cert = tls.cert.as_deref().unwrap(); // safe after validation
+    let key = tls.key.as_deref().unwrap(); // safe after validation
     let ca = tls
         .ca
         .as_deref()
-        .filter(|val| !val.is_empty())
+        .filter(|v| !v.is_empty())
         .map(str::to_string);
-    if tls.require_client_cert && ca.is_none() {
-        bail!("tls.ca is required when require_client_cert = true");
-    }
 
     let tls_paths = TlsCertificatePaths {
         cert,
         private_key: key,
         kind: CertificateKind::X509,
     };
+
     let mut settings = QuicSettings::default();
     if let Some(timeout_ms) = std::env::var("QUIC_IDLE_TIMEOUT_MS")
         .ok()
@@ -117,67 +108,9 @@ fn build_server_params(tls: &TlsConfig) -> Result<ConnectionParams<'_>> {
     {
         settings.max_idle_timeout = Some(StdDuration::from_millis(timeout_ms));
     }
-    let hooks = build_server_hooks(ca, tls.require_client_cert)?;
+
+    let hooks = build_server_tls_hooks(ca, tls.require_client_cert)?;
     Ok(ConnectionParams::new_server(settings, tls_paths, hooks))
-}
-
-struct ServerTlsHook {
-    ca: Option<String>,
-    require_client_cert: bool,
-}
-
-impl ConnectionHook for ServerTlsHook {
-    fn create_custom_ssl_context_builder(
-        &self,
-        settings: TlsCertificatePaths<'_>,
-    ) -> Option<SslContextBuilder> {
-        if settings.kind != CertificateKind::X509 {
-            return None;
-        }
-        let mut builder = SslContextBuilder::new(SslMethod::tls()).ok()?;
-        if let Err(err) = builder.set_certificate_chain_file(settings.cert) {
-            tracing::warn!(error = %err, "failed to load server certificate");
-            return None;
-        }
-        if let Err(err) = builder.set_private_key_file(settings.private_key, SslFiletype::PEM) {
-            tracing::warn!(error = %err, "failed to load server private key");
-            return None;
-        }
-        if let Err(err) = builder.check_private_key() {
-            tracing::warn!(error = %err, "server private key mismatch");
-            return None;
-        }
-        if let Some(ca) = &self.ca {
-            if let Err(err) = builder.set_ca_file(ca) {
-                tracing::warn!(error = %err, "failed to load server CA file");
-                return None;
-            }
-            if let Ok(pem) = std::fs::read(ca) {
-                if let Ok(certs) = X509::stack_from_pem(&pem) {
-                    for cert in certs {
-                        let _ = builder.add_client_ca(&cert);
-                    }
-                }
-            }
-        }
-        if self.require_client_cert {
-            builder.set_verify(SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT);
-        }
-        Some(builder)
-    }
-}
-
-fn build_server_hooks(ca: Option<String>, require_client_cert: bool) -> Result<Hooks> {
-    if ca.is_none() && !require_client_cert {
-        return Ok(Hooks::default());
-    }
-    let hook = ServerTlsHook {
-        ca,
-        require_client_cert,
-    };
-    Ok(Hooks {
-        connection_hook: Some(Arc::new(hook)),
-    })
 }
 
 struct ControlRequest {
@@ -212,7 +145,7 @@ where
     tracing::debug!("beginning control handshake");
     let handshake = begin_control_handshake(&server, &hello)?;
     tracing::debug!("sending nonce");
-    send_framed(&control_stream, handshake.nonce()).await?;
+    send_framed(&control_stream, handshake.nonce(), true).await?;
     tracing::debug!("nonce sent, yielding multiple times");
     for _ in 0..5 {
         tokio::task::yield_now().await;
@@ -222,12 +155,12 @@ where
     let auth: Auth = recv_framed(&mut control_stream, &mut control_decoder).await?;
     let session = match handshake.verify_auth(&auth) {
         Ok(session) => {
-            send_framed(&control_stream, &Ack::Ok).await?;
+            send_framed(&control_stream, &Ack::Ok, true).await?;
             tracing::debug!("control handshake completed");
             session
         }
         Err(err) => {
-            send_framed(&control_stream, &Ack::AuthFailed).await?;
+            send_framed(&control_stream, &Ack::AuthFailed, true).await?;
             return Err(err);
         }
     };
@@ -303,7 +236,7 @@ async fn control_task_with_shutdown(
             _ = ticker.tick() => {
                 // Keep the QUIC connection alive and give clients a liveness signal.
                 // Client currently ignores the payload but reading it resets its idle timer.
-                send_framed(&control_stream, &ControlChannelCmd::Heartbeat).await?;
+                send_framed(&control_stream, &ControlChannelCmd::Heartbeat, true).await?;
                 if last_heartbeat.elapsed() > heartbeat_timeout {
                     return Err(anyhow!("control heartbeat timeout"));
                 }
@@ -328,8 +261,8 @@ async fn control_task_with_shutdown(
 
                 tracing::debug!("requesting data channel");
                 let (cmd, session_key) = session.create_data_channel();
-                send_framed(&control_stream, &cmd).await?;
-                send_framed(&control_stream, &session_key).await?;
+                send_framed(&control_stream, &cmd, true).await?;
+                send_framed(&control_stream, &session_key, true).await?;
 
                 let mut data_stream = manager
                     .accept_stream()
@@ -346,7 +279,7 @@ async fn control_task_with_shutdown(
                     }
                 };
                 let data_cmd = session.accept_data_channel_hello(&hello)?;
-                send_framed(&data_stream, &data_cmd).await?;
+                send_framed(&data_stream, &data_cmd, true).await?;
                 tracing::debug!(mode = ?data_cmd, "data channel ready");
 
                 let _ = request.response.send(Ok(PreparedDataStream {
@@ -409,7 +342,10 @@ async fn handle_tcp_connection(
     tracing::debug!(peer = %peer, "tcp visitor connected");
     let prepared = request_data_stream(req_tx).await?;
     match prepared.mode {
-        DataChannelCmd::StartForwardTcp => forward_tcp(socket, prepared.stream, peer).await,
+        DataChannelCmd::StartForwardTcp => {
+            forward_tcp_bidirectional(socket, prepared.stream, None, format!("peer={}", peer))
+                .await
+        }
         DataChannelCmd::StartForwardUdp => Err(anyhow!("unexpected udp data channel for tcp")),
     }
 }
@@ -508,106 +444,6 @@ async fn request_data_stream(req_tx: mpsc::Sender<ControlRequest>) -> Result<Pre
         .await
         .map_err(|_| anyhow!("control channel closed"))?;
     rx.await.map_err(|_| anyhow!("control channel closed"))?
-}
-
-async fn forward_tcp(socket: TcpStream, stream: QuicStreamHandle, peer: SocketAddr) -> Result<()> {
-    let stream_id = stream.id();
-    tracing::debug!(peer = %peer, stream_id, "tcp forwarding started");
-    let (quic_tx, mut quic_rx) = stream.split();
-    let (mut reader, mut writer) = socket.into_split();
-
-    let to_quic = async {
-        let mut buf = [0u8; 16 * 1024];
-        loop {
-            let n = reader.read(&mut buf).await?;
-            tracing::debug!(peer = %peer, stream_id, bytes = n, "tcp->quic read");
-            if n == 0 {
-                quic_tx.send_fin().await?;
-                break;
-            }
-            quic_tx.send(Bytes::copy_from_slice(&buf[..n])).await?;
-            tracing::debug!(peer = %peer, stream_id, bytes = n, "tcp->quic sent");
-        }
-        Result::<()>::Ok(())
-    };
-
-    let from_quic = async {
-        while let Some(chunk) = quic_rx.recv().await {
-            if !chunk.data.is_empty() {
-                tracing::debug!(
-                    peer = %peer,
-                    stream_id,
-                    bytes = chunk.data.len(),
-                    "quic->tcp recv"
-                );
-                writer.write_all(&chunk.data).await?;
-            }
-            if chunk.fin {
-                tracing::debug!(peer = %peer, stream_id, "quic->tcp fin");
-                writer.shutdown().await?;
-                break;
-            }
-        }
-        Result::<()>::Ok(())
-    };
-
-    tokio::try_join!(to_quic, from_quic)?;
-    tracing::debug!(peer = %peer, "tcp forwarding finished");
-    Ok(())
-}
-
-async fn send_framed<T>(stream: &QuicStreamHandle, msg: &T) -> Result<()>
-where
-    T: Serialize,
-{
-    let frame = encode_message(msg)?;
-    tracing::debug!(
-        stream_id = stream.id(),
-        len = frame.len(),
-        "sending framed message"
-    );
-    stream.send(Bytes::from(frame)).await?;
-
-    // 确保数据有机会被发送到网络
-    for _ in 0..10 {
-        tokio::task::yield_now().await;
-    }
-
-    Ok(())
-}
-
-async fn recv_framed<T>(stream: &mut QuicStreamHandle, decoder: &mut FrameDecoder) -> Result<T>
-where
-    T: DeserializeOwned,
-{
-    tracing::debug!(stream_id = stream.id(), "recv_framed: starting");
-    loop {
-        if let Some(result) = decoder.decode_next::<T>() {
-            tracing::debug!(
-                stream_id = stream.id(),
-                "received framed message from decoder cache"
-            );
-            return result;
-        }
-        tracing::trace!(stream_id = stream.id(), "recv_framed: waiting for chunk");
-        let chunk = stream
-            .recv()
-            .await
-            .ok_or_else(|| anyhow!("quic stream closed"))?;
-        tracing::debug!(
-            stream_id = stream.id(),
-            bytes = chunk.data.len(),
-            fin = chunk.fin,
-            "recv_framed: received chunk"
-        );
-        decoder.push(&chunk.data);
-        if chunk.fin {
-            if let Some(result) = decoder.decode_next::<T>() {
-                return result;
-            }
-            return Err(anyhow!("quic stream finished before message complete"));
-        }
-    }
 }
 
 #[cfg(test)]
