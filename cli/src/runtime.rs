@@ -6,7 +6,7 @@ use quichole_shr::protocol::{encode_message, FrameDecoder};
 use quichole_shr::protocol::{Ack, ControlChannelCmd, DataChannelCmd, UdpTraffic, PROTO_V1};
 use quichole_shr::quic::{
     build_client_tls_hooks, forward_tcp_bidirectional, recv_framed, send_framed, ConnectionRole,
-    QuicApp, QuicConnectionState, QuicStreamHandle,
+    QuicApp, QuicConnectionState, QuicStreamHandle, QuicStreamManager,
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -113,7 +113,7 @@ async fn run_service_once(
     service: &ClientService,
     quic_idle_timeout_ms: Option<u64>,
 ) -> Result<()> {
-    tls.validate_client()?;
+    let (tls_cert_key, ca) = tls.client_params()?;
     let remote = resolve_remote_addr(remote_addr).await?;
     let server_name = tls
         .server_name
@@ -125,28 +125,19 @@ async fn run_service_once(
     udp.connect(remote).await?;
     let socket: Socket<Arc<UdpSocket>, Arc<UdpSocket>> =
         Socket::<Arc<UdpSocket>, Arc<UdpSocket>>::from_udp(udp)?;
-    let cert = tls.cert.as_deref().filter(|val| !val.is_empty());
-    let key = tls.key.as_deref().filter(|val| !val.is_empty());
-    let tls_cert = match (cert, key) {
-        (Some(cert), Some(key)) => Some(TlsCertificatePaths {
+    let tls_cert = tls_cert_key
+        .as_ref()
+        .map(|(cert, key)| TlsCertificatePaths {
             cert,
             private_key: key,
             kind: CertificateKind::X509,
-        }),
-        _ => None,
-    };
+        });
     let mut settings = QuicSettings::default();
     if let Some(timeout_ms) = quic_idle_timeout_ms {
         settings.max_idle_timeout = Some(StdDuration::from_millis(timeout_ms));
     }
     settings.verify_peer = tls.verify_peer;
 
-    // Build TLS hooks - only set CA if client has cert/key for mTLS
-    let ca = if tls_cert.is_some() {
-        tls.ca.as_deref().filter(|val| !val.is_empty()).map(str::to_string)
-    } else {
-        None
-    };
     let hooks = build_client_tls_hooks(ca, tls.verify_peer)?;
     let params = ConnectionParams::new_client(settings, tls_cert, hooks);
 
@@ -194,82 +185,116 @@ async fn run_service_once(
                     return Err(err);
                 }
             };
-        match cmd {
-            ControlChannelCmd::Heartbeat => {
-                if let Err(err) = send_framed(&control_stream, &ControlChannelCmd::Heartbeat, false).await
-                {
-                    tracing::warn!(error = %err, "control channel heartbeat ack failed");
-                    return Err(err);
-                }
-                continue;
+        handle_control_command(
+            cmd,
+            &mut control_stream,
+            &mut control_decoder,
+            &manager,
+            &mut conn_state,
+            service,
+        )
+        .await?;
+    }
+}
+
+async fn handle_control_command(
+    cmd: ControlChannelCmd,
+    control_stream: &mut QuicStreamHandle,
+    control_decoder: &mut FrameDecoder,
+    manager: &QuicStreamManager,
+    conn_state: &mut QuicConnectionState,
+    service: &ClientService,
+) -> Result<()> {
+    match cmd {
+        ControlChannelCmd::Heartbeat => {
+            if let Err(err) =
+                send_framed(control_stream, &ControlChannelCmd::Heartbeat, false).await
+            {
+                tracing::warn!(error = %err, "control channel heartbeat ack failed");
+                return Err(err);
             }
-            ControlChannelCmd::CreateDataChannel => {
-                tracing::debug!("received create data channel");
-                let session_key: [u8; 32] =
-                    recv_framed(&mut control_stream, &mut control_decoder).await?;
-                let stream_id = conn_state.next_data_stream_id()?;
-                let mut data_stream = manager.open_stream(stream_id).await?;
-                tracing::debug!(stream_id, "data stream opened");
-                let data_hello = data_channel_hello(session_key);
-                if let Err(err) = send_framed(&data_stream, &data_hello, false).await {
-                    tracing::warn!(error = %err, stream_id, "send data channel hello failed");
-                    return Err(err);
-                }
-                let mut data_decoder = FrameDecoder::new();
-                let data_cmd: DataChannelCmd =
-                    match recv_framed(&mut data_stream, &mut data_decoder).await {
-                        Ok(cmd) => cmd,
-                        Err(err) => {
-                            tracing::warn!(
-                                error = %err,
-                                stream_id,
-                                "receive data channel cmd failed"
-                            );
-                            return Err(err);
-                        }
-                    };
-                tracing::debug!(mode = ?data_cmd, "data channel accepted");
-                let pending = data_decoder.take_remaining();
-                let pending = if pending.is_empty() {
-                    None
-                } else {
-                    Some(pending.freeze())
+            Ok(())
+        }
+        ControlChannelCmd::CreateDataChannel => {
+            tracing::debug!("received create data channel");
+            let session_key: [u8; 32] = recv_framed(control_stream, control_decoder).await?;
+            let stream_id = conn_state.next_data_stream_id()?;
+            let mut data_stream = manager.open_stream(stream_id).await?;
+            tracing::debug!(stream_id, "data stream opened");
+
+            let data_hello = data_channel_hello(session_key);
+            if let Err(err) = send_framed(&data_stream, &data_hello, false).await {
+                tracing::warn!(error = %err, stream_id, "send data channel hello failed");
+                return Err(err);
+            }
+
+            let mut data_decoder = FrameDecoder::new();
+            let data_cmd: DataChannelCmd =
+                match recv_framed(&mut data_stream, &mut data_decoder).await {
+                    Ok(cmd) => cmd,
+                    Err(err) => {
+                        tracing::warn!(error = %err, stream_id, "receive data channel cmd failed");
+                        return Err(err);
+                    }
+                };
+            tracing::debug!(mode = ?data_cmd, "data channel accepted");
+
+            spawn_data_forward_task(
+                data_cmd,
+                service.local_addr().to_string(),
+                data_stream,
+                pending_from_decoder(&mut data_decoder),
+            );
+
+            Ok(())
+        }
+    }
+}
+
+fn pending_from_decoder(decoder: &mut FrameDecoder) -> Option<Bytes> {
+    let pending = decoder.take_remaining();
+    if pending.is_empty() {
+        None
+    } else {
+        Some(pending.freeze())
+    }
+}
+
+fn spawn_data_forward_task(
+    data_cmd: DataChannelCmd,
+    local_addr: String,
+    data_stream: QuicStreamHandle,
+    pending: Option<Bytes>,
+) {
+    match data_cmd {
+        DataChannelCmd::StartForwardTcp => {
+            tokio::spawn(async move {
+                let socket = match TcpStream::connect(&local_addr).await {
+                    Ok(s) => s,
+                    Err(err) => {
+                        tracing::warn!(error = %err, local_addr, "failed to connect to local tcp service");
+                        return;
+                    }
                 };
 
-                let local_addr = service.local_addr().to_string();
-                match data_cmd {
-                    DataChannelCmd::StartForwardTcp => {
-                        tokio::spawn(async move {
-                            // Connect to local TCP service first
-                            let socket = match TcpStream::connect(&local_addr).await {
-                                Ok(s) => s,
-                                Err(err) => {
-                                    tracing::warn!(error = %err, local_addr, "failed to connect to local tcp service");
-                                    return;
-                                }
-                            };
-
-                            if let Err(err) = forward_tcp_bidirectional(
-                                socket,
-                                data_stream,
-                                pending,
-                                format!("local={}", local_addr),
-                            )
-                            .await
-                            {
-                                tracing::warn!(error = %err, "tcp forward failed");
-                            }
-                        });
-                    }
-                    DataChannelCmd::StartForwardUdp => {
-                        tokio::spawn(async move {
-                            if let Err(err) = forward_udp(&local_addr, data_stream, pending).await {
-                                tracing::warn!(error = %err, "udp forward failed");
-                            }
-                        });
-                    }
+                if let Err(err) = forward_tcp_bidirectional(
+                    socket,
+                    data_stream,
+                    pending,
+                    format!("local={}", local_addr),
+                )
+                .await
+                {
+                    tracing::warn!(error = %err, "tcp forward failed");
                 }
-            }
+            });
+        }
+        DataChannelCmd::StartForwardUdp => {
+            tokio::spawn(async move {
+                if let Err(err) = forward_udp(&local_addr, data_stream, pending).await {
+                    tracing::warn!(error = %err, "udp forward failed");
+                }
+            });
         }
     }
 }
