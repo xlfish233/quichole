@@ -343,8 +343,7 @@ async fn handle_tcp_connection(
     let prepared = request_data_stream(req_tx).await?;
     match prepared.mode {
         DataChannelCmd::StartForwardTcp => {
-            forward_tcp_bidirectional(socket, prepared.stream, None, format!("peer={}", peer))
-                .await
+            forward_tcp_bidirectional(socket, prepared.stream, None, format!("peer={}", peer)).await
         }
         DataChannelCmd::StartForwardUdp => Err(anyhow!("unexpected udp data channel for tcp")),
     }

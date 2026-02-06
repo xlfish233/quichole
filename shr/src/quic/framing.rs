@@ -5,8 +5,8 @@ use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use serde::{de::DeserializeOwned, Serialize};
 
-use crate::protocol::{encode_message, FrameDecoder};
 use super::QuicStreamHandle;
+use crate::protocol::{encode_message, FrameDecoder};
 
 /// 发送带长度前缀的消息到 QUIC 流
 ///
@@ -19,11 +19,7 @@ use super::QuicStreamHandle;
 /// - 消息会被序列化并添加 4 字节长度前缀
 /// - 服务端模式下（`with_yield = true`）会在发送后执行 10 次 `yield_now()`
 ///   以确保数据有机会被发送到网络
-pub async fn send_framed<T>(
-    stream: &QuicStreamHandle,
-    msg: &T,
-    with_yield: bool,
-) -> Result<()>
+pub async fn send_framed<T>(stream: &QuicStreamHandle, msg: &T, with_yield: bool) -> Result<()>
 where
     T: Serialize,
 {
@@ -57,10 +53,7 @@ where
 /// # 错误
 /// - 如果流在消息完整接收前关闭，返回错误
 /// - 如果消息格式无效，返回解码错误
-pub async fn recv_framed<T>(
-    stream: &mut QuicStreamHandle,
-    decoder: &mut FrameDecoder,
-) -> Result<T>
+pub async fn recv_framed<T>(stream: &mut QuicStreamHandle, decoder: &mut FrameDecoder) -> Result<T>
 where
     T: DeserializeOwned,
 {

@@ -122,10 +122,7 @@ impl ConnectionHook for UnifiedTlsHook {
 /// # 返回值
 /// - 如果 `ca` 为 None 且不要求客户端证书，返回默认 Hooks
 /// - 否则返回配置了自定义 TLS 验证的 Hooks
-pub fn build_server_tls_hooks(
-    ca: Option<String>,
-    require_client_cert: bool,
-) -> Result<Hooks> {
+pub fn build_server_tls_hooks(ca: Option<String>, require_client_cert: bool) -> Result<Hooks> {
     if ca.is_none() && !require_client_cert {
         return Ok(Hooks::default());
     }
