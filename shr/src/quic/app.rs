@@ -277,64 +277,95 @@ impl QuicApp {
         }
     }
 
+    fn normalize_chunk_before_send(state: &mut StreamState, chunk: &mut StreamChunk) {
+        if chunk.fin && !chunk.data.is_empty() {
+            state.pending.push_front(StreamChunk {
+                data: Bytes::new(),
+                fin: true,
+            });
+            chunk.fin = false;
+        }
+    }
+
+    fn send_pending_chunk(
+        qconn: &mut quiche::Connection,
+        stream_id: u64,
+        state: &mut StreamState,
+        mut chunk: StreamChunk,
+        total_sent: &mut usize,
+        to_remove: &mut Vec<u64>,
+    ) -> QuicResult<bool> {
+        tracing::trace!(
+            stream_id,
+            data_len = chunk.data.len(),
+            fin = chunk.fin,
+            "attempting to send chunk"
+        );
+
+        Self::normalize_chunk_before_send(state, &mut chunk);
+
+        let send_result = if chunk.data.is_empty() {
+            qconn.stream_send(stream_id, &[], chunk.fin)
+        } else {
+            qconn.stream_send(stream_id, &chunk.data, chunk.fin)
+        };
+
+        match send_result {
+            Ok(sent) => {
+                tracing::trace!(stream_id, sent, total = chunk.data.len(), "sent bytes");
+                *total_sent += sent;
+
+                if !chunk.data.is_empty() && sent < chunk.data.len() {
+                    let remaining = chunk.data.slice(sent..);
+                    tracing::debug!(
+                        stream_id,
+                        remaining = remaining.len(),
+                        "partial send, requeueing"
+                    );
+                    state.pending.push_front(StreamChunk {
+                        data: remaining,
+                        fin: false,
+                    });
+                    return Ok(true);
+                }
+
+                if chunk.fin {
+                    tracing::debug!(stream_id, "stream finished, marking for removal");
+                    to_remove.push(stream_id);
+                    return Ok(true);
+                }
+
+                Ok(false)
+            }
+            Err(quiche::Error::Done) => {
+                tracing::trace!(stream_id, "send would block, requeueing");
+                state.pending.push_front(chunk);
+                Ok(true)
+            }
+            Err(err) => {
+                tracing::warn!(stream_id, error = ?err, "quic stream send failed");
+                Err(Box::new(err))
+            }
+        }
+    }
+
     fn send_pending(&mut self, qconn: &mut quiche::Connection) -> QuicResult<()> {
         let mut to_remove = Vec::new();
         let mut total_sent = 0;
 
         for (&stream_id, state) in self.streams.iter_mut() {
-            while let Some(mut chunk) = state.pending.pop_front() {
-                tracing::trace!(
+            while let Some(chunk) = state.pending.pop_front() {
+                let should_break = Self::send_pending_chunk(
+                    qconn,
                     stream_id,
-                    data_len = chunk.data.len(),
-                    fin = chunk.fin,
-                    "attempting to send chunk"
-                );
-                if chunk.fin && !chunk.data.is_empty() {
-                    state.pending.push_front(StreamChunk {
-                        data: Bytes::new(),
-                        fin: true,
-                    });
-                    chunk.fin = false;
-                }
+                    state,
+                    chunk,
+                    &mut total_sent,
+                    &mut to_remove,
+                )?;
 
-                let send_result = if chunk.data.is_empty() {
-                    qconn.stream_send(stream_id, &[], chunk.fin)
-                } else {
-                    qconn.stream_send(stream_id, &chunk.data, chunk.fin)
-                };
-
-                match send_result {
-                    Ok(sent) => {
-                        tracing::trace!(stream_id, sent, total = chunk.data.len(), "sent bytes");
-                        total_sent += sent;
-                        if !chunk.data.is_empty() && sent < chunk.data.len() {
-                            let remaining = chunk.data.slice(sent..);
-                            tracing::debug!(
-                                stream_id,
-                                remaining = remaining.len(),
-                                "partial send, requeueing"
-                            );
-                            state.pending.push_front(StreamChunk {
-                                data: remaining,
-                                fin: false,
-                            });
-                            break;
-                        }
-                        if chunk.fin {
-                            tracing::debug!(stream_id, "stream finished, marking for removal");
-                            to_remove.push(stream_id);
-                            break;
-                        }
-                    }
-                    Err(quiche::Error::Done) => {
-                        tracing::trace!(stream_id, "send would block, requeueing");
-                        state.pending.push_front(chunk);
-                        break;
-                    }
-                    Err(err) => {
-                        tracing::warn!(stream_id, error = ?err, "quic stream send failed");
-                        return Err(Box::new(err));
-                    }
+                if should_break {
+                    break;
                 }
             }
         }
@@ -346,6 +377,73 @@ impl QuicApp {
         for stream_id in to_remove {
             tracing::debug!(stream_id, "removing finished stream");
             self.streams.remove(&stream_id);
+        }
+
+        Ok(())
+    }
+
+    fn should_drop_reused_stream(&self, stream_id: u64) -> bool {
+        self.seen_streams.contains(&stream_id) && !self.streams.contains_key(&stream_id)
+    }
+
+    fn ensure_incoming_stream_state(&mut self, stream_id: u64) {
+        if !self.streams.contains_key(&stream_id) {
+            tracing::debug!(stream_id, "creating new stream for incoming data");
+            let handle = self.create_stream(stream_id);
+            let _ = self.incoming_tx.send(handle);
+        }
+    }
+
+    fn drain_reused_stream_data(
+        qconn: &mut quiche::Connection,
+        stream_id: u64,
+        buffer: &mut [u8],
+    ) -> QuicResult<()> {
+        loop {
+            match qconn.stream_recv(stream_id, buffer) {
+                Ok((_read, fin)) => {
+                    if fin {
+                        break;
+                    }
+                }
+                Err(quiche::Error::Done) => break,
+                Err(err) => {
+                    tracing::error!(stream_id, error = ?err, "quic stream recv error");
+                    return Err(Box::new(err));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn recv_stream_chunks(
+        qconn: &mut quiche::Connection,
+        stream_id: u64,
+        buffer: &mut [u8],
+        state: &mut StreamState,
+    ) -> QuicResult<()> {
+        loop {
+            match qconn.stream_recv(stream_id, buffer) {
+                Ok((read, fin)) => {
+                    tracing::debug!(stream_id, bytes = read, fin, "quic stream recv");
+                    let chunk = StreamChunk {
+                        data: Bytes::copy_from_slice(&buffer[..read]),
+                        fin,
+                    };
+                    if let Err(err) = state.inbound.send(chunk) {
+                        tracing::error!(stream_id, "failed to send to inbound channel: {:?}", err);
+                    }
+                    if fin {
+                        break;
+                    }
+                }
+                Err(quiche::Error::Done) => break,
+                Err(err) => {
+                    tracing::error!(stream_id, error = ?err, "quic stream recv error");
+                    return Err(Box::new(err));
+                }
+            }
         }
 
         Ok(())
@@ -378,30 +476,13 @@ impl ApplicationOverQuic for QuicApp {
         );
 
         for stream_id in readable_streams {
-            if self.seen_streams.contains(&stream_id) && !self.streams.contains_key(&stream_id) {
+            if self.should_drop_reused_stream(stream_id) {
                 tracing::warn!(stream_id, "dropping data for reused stream id");
-                loop {
-                    match qconn.stream_recv(stream_id, &mut self.buffer) {
-                        Ok((_read, fin)) => {
-                            if fin {
-                                break;
-                            }
-                        }
-                        Err(quiche::Error::Done) => break,
-                        Err(err) => {
-                            tracing::error!(stream_id, error = ?err, "quic stream recv error");
-                            return Err(Box::new(err));
-                        }
-                    }
-                }
+                Self::drain_reused_stream_data(qconn, stream_id, &mut self.buffer)?;
                 continue;
             }
 
-            if !self.streams.contains_key(&stream_id) {
-                tracing::debug!(stream_id, "creating new stream for incoming data");
-                let handle = self.create_stream(stream_id);
-                let _ = self.incoming_tx.send(handle);
-            }
+            self.ensure_incoming_stream_state(stream_id);
 
             let state = match self.streams.get_mut(&stream_id) {
                 Some(state) => state,
@@ -411,32 +492,7 @@ impl ApplicationOverQuic for QuicApp {
                 }
             };
 
-            loop {
-                match qconn.stream_recv(stream_id, &mut self.buffer) {
-                    Ok((read, fin)) => {
-                        tracing::debug!(stream_id, bytes = read, fin, "quic stream recv");
-                        let chunk = StreamChunk {
-                            data: Bytes::copy_from_slice(&self.buffer[..read]),
-                            fin,
-                        };
-                        if let Err(e) = state.inbound.send(chunk) {
-                            tracing::error!(
-                                stream_id,
-                                "failed to send to inbound channel: {:?}",
-                                e
-                            );
-                        }
-                        if fin {
-                            break;
-                        }
-                    }
-                    Err(quiche::Error::Done) => break,
-                    Err(err) => {
-                        tracing::error!(stream_id, error = ?err, "quic stream recv error");
-                        return Err(Box::new(err));
-                    }
-                }
-            }
+            Self::recv_stream_chunks(qconn, stream_id, &mut self.buffer, state)?;
         }
 
         Ok(())
