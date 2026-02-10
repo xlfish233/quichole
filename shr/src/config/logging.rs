@@ -401,8 +401,10 @@ mod tests {
 
     #[test]
     fn test_logging_config_validation_invalid_level() {
-        let mut config = LoggingConfig::default();
-        config.level = "invalid".to_string();
+        let config = LoggingConfig {
+            level: "invalid".to_string(),
+            ..Default::default()
+        };
         assert!(config.validate().is_err());
     }
 

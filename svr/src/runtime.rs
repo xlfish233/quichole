@@ -40,6 +40,17 @@ struct ControlContext {
     next_req_id: u64,
 }
 
+/// Control task parameters grouped together
+struct ControlTaskParams {
+    session: ControlSession,
+    ctx: ControlContext,
+    stream: QuicStreamHandle,
+    manager: QuicStreamManager,
+    req_rx: mpsc::Receiver<ControlRequest>,
+    heartbeat_interval: u64,
+    heartbeat_ack_timeout: u64,
+}
+
 impl ControlContext {
     fn new(conn_epoch: u64) -> Self {
         Self {
@@ -208,18 +219,17 @@ where
     let shutdown_for_service = shutdown.clone();
 
     tokio::spawn(async move {
-        if let Err(err) = control_task_with_shutdown(
+        let params = ControlTaskParams {
             session,
-            control_ctx,
-            control_stream,
+            ctx: control_ctx,
+            stream: control_stream,
             manager,
             req_rx,
             heartbeat_interval,
             heartbeat_ack_timeout,
-            shutdown_for_control,
-        )
-        .await
-        {
+        };
+
+        if let Err(err) = control_task_with_shutdown(params, shutdown_for_control).await {
             tracing::warn!(error = %err, "control task failed");
         }
     });
@@ -351,15 +361,19 @@ async fn server_handshake(
 }
 
 async fn control_task_with_shutdown(
-    mut session: ControlSession,
-    mut control_ctx: ControlContext,
-    mut control_stream: QuicStreamHandle,
-    mut manager: QuicStreamManager,
-    mut req_rx: mpsc::Receiver<ControlRequest>,
-    heartbeat_interval: u64,
-    heartbeat_ack_timeout: u64,
+    params: ControlTaskParams,
     shutdown: ShutdownSignal,
 ) -> Result<()> {
+    let ControlTaskParams {
+        mut session,
+        ctx: mut control_ctx,
+        stream: mut control_stream,
+        mut manager,
+        mut req_rx,
+        heartbeat_interval,
+        heartbeat_ack_timeout,
+    } = params;
+
     let mut ticker = interval(Duration::from_secs(heartbeat_interval));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let heartbeat_timeout = Duration::from_secs(heartbeat_ack_timeout.max(1));

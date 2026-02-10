@@ -318,7 +318,7 @@ async fn test_service_stops_after_control_channel_close() -> Result<()> {
 
     assert_eq!(result.as_slice(), payload);
 
-    let _ = client_shutdown_trigger.shutdown();
+    client_shutdown_trigger.shutdown();
     client_handle.abort();
     let _ = client_handle.await;
     sleep(Duration::from_secs(3)).await;
@@ -424,7 +424,7 @@ async fn test_service_rebinds_after_client_reconnect() -> Result<()> {
 
     assert_eq!(first_round.as_slice(), payload);
 
-    let _ = client_shutdown_trigger.shutdown();
+    client_shutdown_trigger.shutdown();
     client_handle.abort();
     let _ = client_handle.await;
     sleep(Duration::from_secs(3)).await;
@@ -454,7 +454,7 @@ async fn test_service_rebinds_after_client_reconnect() -> Result<()> {
 
     assert_eq!(second_round.as_slice(), payload);
 
-    let _ = client_shutdown_trigger.shutdown();
+    client_shutdown_trigger.shutdown();
     client_handle.abort();
     server_handle.abort();
     echo_handle.abort();
