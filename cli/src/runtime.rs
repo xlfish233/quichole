@@ -1,9 +1,10 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use quichole_shr::config::TlsConfig;
-use quichole_shr::logging::{RedactedNonce, ShutdownSignal};
-use quichole_shr::protocol::{encode_message, FrameDecoder};
-use quichole_shr::protocol::{Ack, ControlChannelCmd, DataChannelCmd, UdpTraffic, PROTO_V1};
+use quichole_shr::logging::ShutdownSignal;
+use quichole_shr::protocol::{
+    encode_message, ControlFrame, DataChannelCmd, DataChannelHelloV2, FrameDecoder, UdpTraffic,
+};
 use quichole_shr::quic::{
     build_client_tls_hooks, forward_tcp_bidirectional, recv_framed, send_framed, ConnectionRole,
     QuicApp, QuicConnectionState, QuicStreamHandle, QuicStreamManager,
@@ -13,15 +14,61 @@ use std::sync::Arc;
 use std::time::Duration as StdDuration;
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::task::JoinSet;
-use tokio::time::{sleep, Duration};
+use tokio::time::{sleep, timeout, Duration};
 use tokio_quiche::quic::connect_with_config;
 use tokio_quiche::settings::{CertificateKind, QuicSettings, TlsCertificatePaths};
 use tokio_quiche::socket::Socket;
 use tokio_quiche::ConnectionParams;
 
 use crate::client::ClientState;
-use crate::handshake::{auth_message, control_hello, data_channel_hello, verify_ack};
+use crate::handshake::{
+    build_data_channel_resp, client_auth, client_hello, data_channel_hello, map_mode,
+    verify_auth_result, ClientHandshakeContext,
+};
 use crate::service::ClientService;
+
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(800);
+const HANDSHAKE_MAX_RETRY: u32 = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClientControlState {
+    Init,
+    WaitChallenge,
+    WaitAuthResult,
+    WaitReady,
+    Ready,
+    Closed,
+}
+
+#[derive(Debug)]
+struct ControlContext {
+    conn_epoch: u64,
+    hs_seq: u64,
+    state: ClientControlState,
+    conn_state: QuicConnectionState,
+}
+
+impl ControlContext {
+    fn new(conn_epoch: u64) -> Self {
+        Self {
+            conn_epoch,
+            hs_seq: 1,
+            state: ClientControlState::Init,
+            conn_state: QuicConnectionState::new(ConnectionRole::Client),
+        }
+    }
+
+    fn handshake_ctx(&self) -> ClientHandshakeContext {
+        ClientHandshakeContext {
+            conn_epoch: self.conn_epoch,
+            hs_seq: self.hs_seq,
+        }
+    }
+
+    fn validate_epoch(&self, incoming_epoch: u64) -> bool {
+        incoming_epoch == self.conn_epoch
+    }
+}
 
 pub async fn run_client(client: ClientState, shutdown: ShutdownSignal) -> Result<()> {
     run_client_with_shutdown(client, shutdown).await
@@ -82,14 +129,16 @@ async fn run_service_with_shutdown(
     quic_idle_timeout_ms: Option<u64>,
     shutdown: ShutdownSignal,
 ) -> Result<()> {
+    let mut conn_epoch = 0_u64;
     loop {
+        conn_epoch = conn_epoch.saturating_add(1);
         let mut shutdown_rx = shutdown.subscribe();
         tokio::select! {
             _ = shutdown_rx.recv() => {
                 tracing::info!(service = service.name(), "service shutdown requested");
                 return Ok(());
             }
-            result = run_service_once(&remote_addr, &tls, &service, quic_idle_timeout_ms) => {
+            result = run_service_once(&remote_addr, &tls, &service, quic_idle_timeout_ms, conn_epoch) => {
                 match result {
                     Ok(()) => return Ok(()),
                     Err(err) => {
@@ -97,6 +146,7 @@ async fn run_service_with_shutdown(
                             error = %err,
                             service = service.name(),
                             retry_interval,
+                            conn_epoch,
                             "service connection failed, retrying"
                         );
                         sleep(Duration::from_secs(retry_interval)).await;
@@ -112,6 +162,7 @@ async fn run_service_once(
     tls: &TlsConfig,
     service: &ClientService,
     quic_idle_timeout_ms: Option<u64>,
+    conn_epoch: u64,
 ) -> Result<()> {
     let tls_params = tls.client_params()?;
     let remote = resolve_remote_addr(remote_addr).await?;
@@ -133,7 +184,9 @@ async fn run_service_once(
             private_key: &pair.key,
             kind: CertificateKind::X509,
         });
+
     let mut settings = QuicSettings::default();
+    settings.max_ack_delay = 100;
     if let Some(timeout_ms) = quic_idle_timeout_ms {
         settings.max_idle_timeout = Some(StdDuration::from_millis(timeout_ms));
     }
@@ -146,119 +199,194 @@ async fn run_service_once(
     let _conn = connect_with_config(socket, Some(server_name.as_str()), &params, app)
         .await
         .map_err(|err| anyhow!(err))?;
-    tracing::debug!("quic connected");
+    tracing::debug!(conn_epoch, "quic connected");
 
     let (mut control_stream, manager) = handle.split();
     let mut control_decoder = FrameDecoder::new();
+    let mut control_ctx = ControlContext::new(conn_epoch);
 
-    let hello = control_hello(service.name());
-    if hello.version() != PROTO_V1 {
-        return Err(anyhow!("protocol version mismatch"));
-    }
-
-    send_framed(&control_stream, &hello, false).await?;
-    tracing::debug!("hello sent, waiting for nonce");
-    let nonce: [u8; 32] = recv_framed(&mut control_stream, &mut control_decoder).await?;
-    tracing::debug!(
-        nonce = %RedactedNonce(nonce),
-        "nonce received from server, sending auth"
-    );
-    let auth = auth_message(service.token(), &nonce);
-    tracing::debug!("auth message computed from token and nonce");
-    send_framed(&control_stream, &auth, false).await?;
-    tracing::debug!("auth sent, yielding multiple times");
-    for _ in 0..5 {
-        tokio::task::yield_now().await;
-    }
-    tracing::debug!("waiting for ack");
-    let ack: Ack = recv_framed(&mut control_stream, &mut control_decoder).await?;
-    verify_ack(&ack)?;
-    tracing::debug!("control handshake completed");
-
-    let mut conn_state = QuicConnectionState::new(ConnectionRole::Client);
-
-    loop {
-        let cmd: ControlChannelCmd =
-            match recv_framed(&mut control_stream, &mut control_decoder).await {
-                Ok(cmd) => cmd,
-                Err(err) => {
-                    tracing::warn!(error = %err, "control channel read failed");
-                    return Err(err);
-                }
-            };
-        handle_control_command(
-            cmd,
-            &mut control_stream,
-            &mut control_decoder,
-            &manager,
-            &mut conn_state,
-            service,
-        )
-        .await?;
-    }
+    run_control_owner(
+        &mut control_stream,
+        &mut control_decoder,
+        &manager,
+        service,
+        &mut control_ctx,
+    )
+    .await
 }
 
-async fn handle_control_command(
-    cmd: ControlChannelCmd,
+async fn run_control_owner(
     control_stream: &mut QuicStreamHandle,
     control_decoder: &mut FrameDecoder,
     manager: &QuicStreamManager,
-    conn_state: &mut QuicConnectionState,
     service: &ClientService,
+    control_ctx: &mut ControlContext,
 ) -> Result<()> {
-    match cmd {
-        ControlChannelCmd::Heartbeat => {
-            if let Err(err) =
-                send_framed(control_stream, &ControlChannelCmd::Heartbeat, false).await
-            {
-                tracing::warn!(error = %err, "control channel heartbeat ack failed");
-                return Err(err);
+    client_handshake(control_stream, control_decoder, service, control_ctx).await?;
+    control_ctx.state = ClientControlState::Ready;
+
+    loop {
+        let frame: ControlFrame = recv_framed(control_stream, control_decoder).await?;
+        if let Some(epoch) = frame.conn_epoch() {
+            if !control_ctx.validate_epoch(epoch) {
+                tracing::warn!(
+                    expected = control_ctx.conn_epoch,
+                    got = epoch,
+                    "drop control frame from stale epoch"
+                );
+                continue;
             }
-            Ok(())
         }
-        ControlChannelCmd::CreateDataChannel => {
-            tracing::debug!("received create data channel");
-            let session_key: [u8; 32] = recv_framed(control_stream, control_decoder).await?;
-            let stream_id = conn_state.next_data_stream_id()?;
-            let mut data_stream = manager.open_stream(stream_id).await?;
-            tracing::debug!(stream_id, "data stream opened");
 
-            let data_hello = data_channel_hello(session_key);
-            if let Err(err) = send_framed(&data_stream, &data_hello, false).await {
-                tracing::warn!(error = %err, stream_id, "send data channel hello failed");
-                return Err(err);
+        match frame {
+            ControlFrame::Heartbeat { conn_epoch, tick } => {
+                let ack = ControlFrame::Heartbeat { conn_epoch, tick };
+                send_framed(control_stream, &ack, false).await?;
             }
+            ControlFrame::OpenDataChannelReq {
+                conn_epoch,
+                req_id,
+                session_key,
+                mode,
+            } => {
+                let result = handle_data_channel_request(
+                    manager,
+                    service,
+                    control_ctx,
+                    conn_epoch,
+                    req_id,
+                    session_key,
+                    mode,
+                )
+                .await;
 
-            let mut data_decoder = FrameDecoder::new();
-            let data_cmd: DataChannelCmd =
-                match recv_framed(&mut data_stream, &mut data_decoder).await {
-                    Ok(cmd) => cmd,
-                    Err(err) => {
-                        tracing::warn!(error = %err, stream_id, "receive data channel cmd failed");
-                        return Err(err);
+                match result {
+                    Ok(()) => {
+                        let resp = build_data_channel_resp(conn_epoch, req_id, true, None);
+                        send_framed(control_stream, &resp, false).await?;
                     }
-                };
-            tracing::debug!(mode = ?data_cmd, "data channel accepted");
-
-            spawn_data_forward_task(
-                data_cmd,
-                service.local_addr().to_string(),
-                data_stream,
-                pending_from_decoder(&mut data_decoder),
-            );
-
-            Ok(())
+                    Err(err) => {
+                        tracing::warn!(error = %err, req_id, "data channel request failed");
+                        let resp = build_data_channel_resp(
+                            conn_epoch,
+                            req_id,
+                            false,
+                            Some(err.to_string()),
+                        );
+                        send_framed(control_stream, &resp, false).await?;
+                    }
+                }
+            }
+            other => {
+                tracing::warn!(frame = ?other, "unexpected control frame in ready state");
+            }
         }
     }
 }
 
-fn pending_from_decoder(decoder: &mut FrameDecoder) -> Option<Bytes> {
-    let pending = decoder.take_remaining();
-    if pending.is_empty() {
-        None
-    } else {
-        Some(pending.freeze())
+async fn client_handshake(
+    control_stream: &mut QuicStreamHandle,
+    control_decoder: &mut FrameDecoder,
+    service: &ClientService,
+    control_ctx: &mut ControlContext,
+) -> Result<()> {
+    let hello = client_hello(service.name(), control_ctx.conn_epoch, control_ctx.hs_seq);
+
+    for retry in 0..=HANDSHAKE_MAX_RETRY {
+        control_ctx.state = ClientControlState::WaitChallenge;
+        send_framed(control_stream, &hello, false).await?;
+
+        let challenge = timeout(
+            HANDSHAKE_TIMEOUT,
+            recv_framed::<ControlFrame>(control_stream, control_decoder),
+        )
+        .await
+        .context("timeout waiting server challenge")??;
+
+        let nonce = match challenge {
+            ControlFrame::ServerChallenge {
+                conn_epoch,
+                hs_seq,
+                nonce,
+            } if conn_epoch == control_ctx.conn_epoch && hs_seq == control_ctx.hs_seq => nonce,
+            other => {
+                tracing::warn!(retry, frame = ?other, "unexpected challenge frame");
+                continue;
+            }
+        };
+
+        control_ctx.state = ClientControlState::WaitAuthResult;
+        let auth = client_auth(service.token(), &nonce, &control_ctx.handshake_ctx());
+        send_framed(control_stream, &auth, false).await?;
+
+        let auth_result = timeout(
+            HANDSHAKE_TIMEOUT,
+            recv_framed::<ControlFrame>(control_stream, control_decoder),
+        )
+        .await
+        .context("timeout waiting auth result")??;
+
+        let result = match auth_result {
+            ControlFrame::ServerAuthResult {
+                conn_epoch,
+                hs_seq,
+                result,
+            } if conn_epoch == control_ctx.conn_epoch && hs_seq == control_ctx.hs_seq => result,
+            other => {
+                tracing::warn!(retry, frame = ?other, "unexpected auth result frame");
+                continue;
+            }
+        };
+
+        verify_auth_result(&result)?;
+
+        control_ctx.state = ClientControlState::WaitReady;
+        let ready = timeout(
+            HANDSHAKE_TIMEOUT,
+            recv_framed::<ControlFrame>(control_stream, control_decoder),
+        )
+        .await
+        .context("timeout waiting control ready")??;
+
+        match ready {
+            ControlFrame::ControlReady { conn_epoch } if conn_epoch == control_ctx.conn_epoch => {
+                return Ok(());
+            }
+            other => {
+                tracing::warn!(retry, frame = ?other, "unexpected control ready frame");
+                continue;
+            }
+        }
     }
+
+    control_ctx.state = ClientControlState::Closed;
+    Err(anyhow!("handshake failed after retries"))
+}
+
+async fn handle_data_channel_request(
+    manager: &QuicStreamManager,
+    service: &ClientService,
+    control_ctx: &mut ControlContext,
+    conn_epoch: u64,
+    req_id: u64,
+    session_key: [u8; 32],
+    mode: DataChannelCmd,
+) -> Result<()> {
+    let stream_id = control_ctx.conn_state.next_data_stream_id()?;
+    tracing::debug!(req_id, stream_id, mode = ?mode, "open data channel request received");
+    let data_stream = manager.open_stream(stream_id).await?;
+
+    let hello: DataChannelHelloV2 = data_channel_hello(conn_epoch, req_id, session_key);
+    send_framed(&data_stream, &hello, false).await?;
+
+    spawn_data_forward_task(
+        map_mode(mode),
+        service.local_addr().to_string(),
+        data_stream,
+        None,
+    );
+
+    Ok(())
 }
 
 fn spawn_data_forward_task(

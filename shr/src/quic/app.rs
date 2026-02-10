@@ -6,12 +6,29 @@ use tokio::sync::{mpsc, oneshot, Notify};
 use tokio_quiche::quic::HandshakeInfo;
 use tokio_quiche::{quiche, ApplicationOverQuic, QuicResult};
 
-const STREAM_CHANNEL_SIZE: usize = 64;
+use super::stream::CONTROL_STREAM_ID;
 
-#[derive(Debug, Clone)]
+const STREAM_CHANNEL_SIZE: usize = 64;
+const MAX_PENDING_CHUNKS_PER_STREAM: usize = STREAM_CHANNEL_SIZE;
+
+fn is_recoverable_send_error(error: &quiche::Error) -> bool {
+    matches!(
+        error,
+        quiche::Error::Done
+            | quiche::Error::InvalidState
+            | quiche::Error::InvalidStreamState(_)
+            | quiche::Error::StreamStopped(_)
+            | quiche::Error::StreamReset(_)
+            | quiche::Error::StreamLimit
+    )
+}
+
+#[derive(Debug)]
 pub struct StreamChunk {
     pub data: Bytes,
     pub fin: bool,
+    /// Optional sender to notify when data is actually sent to quiche
+    pub flush_tx: Option<oneshot::Sender<()>>,
 }
 
 pub struct QuicStreamHandle {
@@ -61,6 +78,16 @@ impl QuicStreamHandle {
         .await
     }
 
+    pub async fn send_and_wait(&self, data: Bytes) -> Result<()> {
+        QuicStreamSender {
+            id: self.id,
+            outbound: self.outbound.clone(),
+            notify: self.notify.clone(),
+        }
+        .send_and_wait(data)
+        .await
+    }
+
     pub async fn send_fin(&self) -> Result<()> {
         QuicStreamSender {
             id: self.id,
@@ -78,6 +105,10 @@ impl QuicStreamHandle {
         }
         chunk
     }
+
+    pub fn is_closed(&self) -> bool {
+        self.inbound.is_closed()
+    }
 }
 
 impl QuicStreamSender {
@@ -92,11 +123,43 @@ impl QuicStreamSender {
             "QuicStreamSender::send"
         );
         self.outbound
-            .send(StreamChunk { data, fin: false })
+            .send(StreamChunk {
+                data,
+                fin: false,
+                flush_tx: None,
+            })
             .await
             .map_err(|_| anyhow!("stream outbound channel closed"))?;
         tracing::trace!(stream_id = self.id, "QuicStreamSender::send - notifying");
         self.notify.notify_one();
+        Ok(())
+    }
+
+    /// Send data and wait for it to be actually sent to quiche connection
+    pub async fn send_and_wait(&self, data: Bytes) -> Result<()> {
+        tracing::trace!(
+            stream_id = self.id,
+            len = data.len(),
+            "QuicStreamSender::send_and_wait"
+        );
+        let (tx, rx) = oneshot::channel();
+        self.outbound
+            .send(StreamChunk {
+                data,
+                fin: false,
+                flush_tx: Some(tx),
+            })
+            .await
+            .map_err(|_| anyhow!("stream outbound channel closed"))?;
+        self.notify.notify_one();
+
+        // Wait for flush completion notification
+        rx.await
+            .map_err(|_| anyhow!("flush notification channel closed"))?;
+        tracing::trace!(
+            stream_id = self.id,
+            "QuicStreamSender::send_and_wait - flushed"
+        );
         Ok(())
     }
 
@@ -105,6 +168,7 @@ impl QuicStreamSender {
             .send(StreamChunk {
                 data: Bytes::new(),
                 fin: true,
+                flush_tx: None,
             })
             .await
             .map_err(|_| anyhow!("stream outbound channel closed"))?;
@@ -173,6 +237,15 @@ struct StreamState {
     inbound: mpsc::UnboundedSender<StreamChunk>,
     outbound: mpsc::Receiver<StreamChunk>,
     pending: VecDeque<StreamChunk>,
+    local_fin_sent: bool,
+    peer_fin_recv: bool,
+    outbound_closed: bool,
+}
+
+impl Drop for StreamState {
+    fn drop(&mut self) {
+        tracing::warn!("StreamState dropped - inbound channel will be closed");
+    }
 }
 
 pub struct QuicApp {
@@ -229,6 +302,9 @@ impl QuicApp {
                 inbound: inbound_tx,
                 outbound: outbound_rx,
                 pending: VecDeque::new(),
+                local_fin_sent: false,
+                peer_fin_recv: false,
+                outbound_closed: false,
             },
         );
 
@@ -261,7 +337,11 @@ impl QuicApp {
     fn enqueue_outbound(&mut self) {
         let mut enqueued = 0;
         for (stream_id, state) in self.streams.iter_mut() {
-            while let Ok(chunk) = state.outbound.try_recv() {
+            while state.pending.len() < MAX_PENDING_CHUNKS_PER_STREAM {
+                let Ok(chunk) = state.outbound.try_recv() else {
+                    break;
+                };
+
                 tracing::trace!(
                     stream_id,
                     data_len = chunk.data.len(),
@@ -270,6 +350,10 @@ impl QuicApp {
                 );
                 state.pending.push_back(chunk);
                 enqueued += 1;
+            }
+
+            if state.outbound.is_closed() {
+                state.outbound_closed = true;
             }
         }
         if enqueued > 0 {
@@ -282,6 +366,7 @@ impl QuicApp {
             state.pending.push_front(StreamChunk {
                 data: Bytes::new(),
                 fin: true,
+                flush_tx: None,
             });
             chunk.fin = false;
         }
@@ -293,7 +378,6 @@ impl QuicApp {
         state: &mut StreamState,
         mut chunk: StreamChunk,
         total_sent: &mut usize,
-        to_remove: &mut Vec<u64>,
     ) -> QuicResult<bool> {
         tracing::trace!(
             stream_id,
@@ -315,6 +399,12 @@ impl QuicApp {
                 tracing::trace!(stream_id, sent, total = chunk.data.len(), "sent bytes");
                 *total_sent += sent;
 
+                // Send flush notification if requested
+                if let Some(tx) = chunk.flush_tx {
+                    // Ignore errors - the receiver might have dropped
+                    let _ = tx.send(());
+                }
+
                 if !chunk.data.is_empty() && sent < chunk.data.len() {
                     let remaining = chunk.data.slice(sent..);
                     tracing::debug!(
@@ -325,44 +415,69 @@ impl QuicApp {
                     state.pending.push_front(StreamChunk {
                         data: remaining,
                         fin: false,
+                        flush_tx: None, // Don't propagate flush_tx for requeued chunks
                     });
                     return Ok(true);
                 }
 
                 if chunk.fin {
-                    tracing::debug!(stream_id, "stream finished, marking for removal");
-                    to_remove.push(stream_id);
+                    state.local_fin_sent = true;
+                    tracing::debug!(stream_id, "stream local fin sent");
                     return Ok(true);
                 }
 
                 Ok(false)
             }
-            Err(quiche::Error::Done) => {
-                tracing::trace!(stream_id, "send would block, requeueing");
+            Err(quiche::Error::Done | quiche::Error::StreamLimit) => {
+                tracing::trace!(stream_id, "send blocked by flow/stream limit, requeueing");
                 state.pending.push_front(chunk);
                 Ok(true)
             }
             Err(err) => {
-                tracing::warn!(stream_id, error = ?err, "quic stream send failed");
+                if is_recoverable_send_error(&err) {
+                    tracing::warn!(
+                        stream_id,
+                        error = ?err,
+                        "quic stream send recoverable error, dropping chunk"
+                    );
+                    if let Some(tx) = chunk.flush_tx {
+                        drop(tx);
+                    }
+                    return Ok(true);
+                }
+
+                tracing::error!(
+                    stream_id,
+                    error = ?err,
+                    error_debug = format!("{:?}", err),
+                    "quic stream send failed - THIS WILL CLOSE THE CONNECTION"
+                );
+                // Send error notification if requested
+                if let Some(tx) = chunk.flush_tx {
+                    // Receiver will get error from channel closure
+                    drop(tx);
+                }
                 Err(Box::new(err))
             }
         }
     }
 
     fn send_pending(&mut self, qconn: &mut quiche::Connection) -> QuicResult<()> {
-        let mut to_remove = Vec::new();
         let mut total_sent = 0;
+
+        // 检查连接状态
+        if qconn.is_closed() {
+            tracing::error!("send_pending: quiche connection is already closed!");
+            return Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "quiche connection is closed",
+            )));
+        }
 
         for (&stream_id, state) in self.streams.iter_mut() {
             while let Some(chunk) = state.pending.pop_front() {
-                let should_break = Self::send_pending_chunk(
-                    qconn,
-                    stream_id,
-                    state,
-                    chunk,
-                    &mut total_sent,
-                    &mut to_remove,
-                )?;
+                let should_break =
+                    Self::send_pending_chunk(qconn, stream_id, state, chunk, &mut total_sent)?;
 
                 if should_break {
                     break;
@@ -374,12 +489,46 @@ impl QuicApp {
             tracing::debug!(total_sent, "total bytes sent in this cycle");
         }
 
-        for stream_id in to_remove {
-            tracing::debug!(stream_id, "removing finished stream");
-            self.streams.remove(&stream_id);
+        // 再次检查连接状态
+        if qconn.is_closed() {
+            tracing::error!(
+                "send_pending: quiche connection closed after sending {} bytes!",
+                total_sent
+            );
         }
 
+        self.remove_terminal_streams();
+
         Ok(())
+    }
+
+    fn should_remove_stream_state(stream_id: u64, state: &StreamState) -> bool {
+        if stream_id == CONTROL_STREAM_ID {
+            return false;
+        }
+
+        state.pending.is_empty()
+            && state.peer_fin_recv
+            && (state.local_fin_sent || state.outbound_closed)
+    }
+
+    fn remove_terminal_streams(&mut self) {
+        let to_remove: Vec<u64> = self
+            .streams
+            .iter()
+            .filter_map(|(&stream_id, state)| {
+                if Self::should_remove_stream_state(stream_id, state) {
+                    Some(stream_id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for stream_id in to_remove {
+            tracing::debug!(stream_id, "removing terminal stream");
+            self.streams.remove(&stream_id);
+        }
     }
 
     fn should_drop_reused_stream(&self, stream_id: u64) -> bool {
@@ -430,11 +579,14 @@ impl QuicApp {
                     let chunk = StreamChunk {
                         data: Bytes::copy_from_slice(&buffer[..read]),
                         fin,
+                        flush_tx: None, // Incoming chunks don't need flush notification
                     };
                     if let Err(err) = state.inbound.send(chunk) {
                         tracing::error!(stream_id, "failed to send to inbound channel: {:?}", err);
                     }
                     if fin {
+                        state.peer_fin_recv = true;
+                        tracing::debug!(stream_id, "stream peer fin received");
                         break;
                     }
                 }
@@ -447,6 +599,15 @@ impl QuicApp {
         }
 
         Ok(())
+    }
+}
+
+impl Drop for QuicApp {
+    fn drop(&mut self) {
+        tracing::warn!(
+            streams_count = self.streams.len(),
+            "QuicApp dropped - all streams will be closed"
+        );
     }
 }
 
@@ -539,6 +700,19 @@ impl ApplicationOverQuic for QuicApp {
 mod tests {
     use super::*;
 
+    fn make_stream_state() -> StreamState {
+        let (inbound_tx, _inbound_rx) = mpsc::unbounded_channel();
+        let (_outbound_tx, outbound_rx) = mpsc::channel(STREAM_CHANNEL_SIZE);
+        StreamState {
+            inbound: inbound_tx,
+            outbound: outbound_rx,
+            pending: VecDeque::new(),
+            local_fin_sent: false,
+            peer_fin_recv: false,
+            outbound_closed: false,
+        }
+    }
+
     #[tokio::test]
     async fn test_rejects_reused_stream_id() {
         let (mut app, _handle) = QuicApp::new(0);
@@ -560,5 +734,70 @@ mod tests {
         assert!(result.is_err());
         let err = result.err().unwrap();
         assert!(err.to_string().contains("already used"));
+    }
+
+    #[test]
+    fn test_stream_removed_only_after_bidirectional_finish() {
+        let mut state = make_stream_state();
+        state.local_fin_sent = true;
+        assert!(!QuicApp::should_remove_stream_state(4, &state));
+
+        state.peer_fin_recv = true;
+        assert!(QuicApp::should_remove_stream_state(4, &state));
+    }
+
+    #[test]
+    fn test_control_stream_never_removed() {
+        let mut state = make_stream_state();
+        state.local_fin_sent = true;
+        state.peer_fin_recv = true;
+        assert!(!QuicApp::should_remove_stream_state(
+            CONTROL_STREAM_ID,
+            &state
+        ));
+    }
+
+    #[test]
+    fn test_enqueue_outbound_respects_pending_limit() {
+        let (mut app, _handle) = QuicApp::new(CONTROL_STREAM_ID);
+        let stream_id = 4;
+
+        let (inbound_tx, _inbound_rx) = mpsc::unbounded_channel();
+        let (outbound_tx, outbound_rx) = mpsc::channel(STREAM_CHANNEL_SIZE);
+
+        let mut pending = VecDeque::new();
+        for _ in 0..MAX_PENDING_CHUNKS_PER_STREAM {
+            pending.push_back(StreamChunk {
+                data: Bytes::from_static(b"a"),
+                fin: false,
+                flush_tx: None,
+            });
+        }
+
+        outbound_tx
+            .try_send(StreamChunk {
+                data: Bytes::from_static(b"b"),
+                fin: false,
+                flush_tx: None,
+            })
+            .unwrap();
+
+        app.streams.insert(
+            stream_id,
+            StreamState {
+                inbound: inbound_tx,
+                outbound: outbound_rx,
+                pending,
+                local_fin_sent: false,
+                peer_fin_recv: false,
+                outbound_closed: false,
+            },
+        );
+
+        app.enqueue_outbound();
+
+        let state = app.streams.get_mut(&stream_id).unwrap();
+        assert_eq!(state.pending.len(), MAX_PENDING_CHUNKS_PER_STREAM);
+        assert!(state.outbound.try_recv().is_ok());
     }
 }

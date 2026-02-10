@@ -6,6 +6,20 @@ use std::net::SocketAddr;
 /// 协议版本 1
 pub const PROTO_V1: u8 = 1;
 
+/// 协议版本 2（控制通道状态机重构版本）
+pub const PROTO_V2: u8 = 2;
+
+/// 认证结果
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub enum AuthResult {
+    /// 认证成功
+    Ok,
+    /// 服务不存在
+    ServiceNotExist,
+    /// 认证失败
+    AuthFailed,
+}
+
 /// Hello 消息，用于初始化控制通道和数据通道
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub enum Hello {
@@ -73,12 +87,96 @@ pub enum ControlChannelCmd {
 }
 
 /// 数据通道命令，服务端通过数据通道发送的命令
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataChannelCmd {
     /// 开始 TCP 转发
     StartForwardTcp,
     /// 开始 UDP 转发
     StartForwardUdp,
+}
+
+/// 控制通道统一帧（V2）
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub enum ControlFrame {
+    /// 客户端发起控制握手
+    ClientHello {
+        version: u8,
+        service_digest: [u8; 32],
+        conn_epoch: u64,
+        hs_seq: u64,
+    },
+
+    /// 服务端下发挑战
+    ServerChallenge {
+        conn_epoch: u64,
+        hs_seq: u64,
+        nonce: [u8; 32],
+    },
+
+    /// 客户端提交认证摘要
+    ClientAuth {
+        conn_epoch: u64,
+        hs_seq: u64,
+        digest: [u8; 32],
+    },
+
+    /// 服务端返回认证结果
+    ServerAuthResult {
+        conn_epoch: u64,
+        hs_seq: u64,
+        result: AuthResult,
+    },
+
+    /// 控制通道进入 Ready 状态
+    ControlReady { conn_epoch: u64 },
+
+    /// 心跳
+    Heartbeat { conn_epoch: u64, tick: u64 },
+
+    /// 请求客户端创建数据通道
+    OpenDataChannelReq {
+        conn_epoch: u64,
+        req_id: u64,
+        session_key: [u8; 32],
+        mode: DataChannelCmd,
+    },
+
+    /// 客户端对数据通道请求的响应
+    OpenDataChannelResp {
+        conn_epoch: u64,
+        req_id: u64,
+        accepted: bool,
+        error: Option<String>,
+    },
+}
+
+/// 数据通道握手消息（V2）
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct DataChannelHelloV2 {
+    /// 协议版本
+    pub version: u8,
+    /// 当前连接代次（用于跨重连隔离）
+    pub conn_epoch: u64,
+    /// 控制通道请求序号
+    pub req_id: u64,
+    /// 服务端发放的会话密钥
+    pub session_key: [u8; 32],
+}
+
+impl ControlFrame {
+    /// 获取帧所属连接代次（如果有）
+    pub const fn conn_epoch(&self) -> Option<u64> {
+        match self {
+            ControlFrame::ClientHello { conn_epoch, .. }
+            | ControlFrame::ServerChallenge { conn_epoch, .. }
+            | ControlFrame::ClientAuth { conn_epoch, .. }
+            | ControlFrame::ServerAuthResult { conn_epoch, .. }
+            | ControlFrame::ControlReady { conn_epoch }
+            | ControlFrame::Heartbeat { conn_epoch, .. }
+            | ControlFrame::OpenDataChannelReq { conn_epoch, .. }
+            | ControlFrame::OpenDataChannelResp { conn_epoch, .. } => Some(*conn_epoch),
+        }
+    }
 }
 
 /// UDP 流量封装，UDP 数据包需要携带源地址信息
@@ -167,6 +265,32 @@ mod tests {
             let decoded: DataChannelCmd = bincode::deserialize(&encoded).unwrap();
             assert_eq!(cmd, decoded);
         }
+    }
+
+    #[test]
+    fn test_control_frame_serialization() {
+        let frame = ControlFrame::ClientHello {
+            version: PROTO_V2,
+            service_digest: [3u8; 32],
+            conn_epoch: 7,
+            hs_seq: 1,
+        };
+        let encoded = bincode::serialize(&frame).unwrap();
+        let decoded: ControlFrame = bincode::deserialize(&encoded).unwrap();
+        assert_eq!(frame, decoded);
+    }
+
+    #[test]
+    fn test_data_channel_hello_v2_serialization() {
+        let hello = DataChannelHelloV2 {
+            version: PROTO_V2,
+            conn_epoch: 9,
+            req_id: 11,
+            session_key: [4u8; 32],
+        };
+        let encoded = bincode::serialize(&hello).unwrap();
+        let decoded: DataChannelHelloV2 = bincode::deserialize(&encoded).unwrap();
+        assert_eq!(hello, decoded);
     }
 
     #[test]

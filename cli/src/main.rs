@@ -6,9 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use quichole_cli::client::ClientState;
-use quichole_cli::handshake::{auth_message, control_hello, data_channel_hello, verify_ack};
 use quichole_cli::runtime::run_client;
-use quichole_shr::protocol::{generate_nonce, Ack};
 
 use tokio::signal::ctrl_c;
 
@@ -34,7 +32,6 @@ fn load_config(path: &Path) -> Result<ClientConfig> {
     Ok(config)
 }
 
-/// Wait for Ctrl+C or SIGTERM and return when received
 async fn wait_for_shutdown_signal() {
     let ctrl_c = async {
         ctrl_c().await.expect("failed to install Ctrl+C handler");
@@ -60,13 +57,11 @@ async fn wait_for_shutdown_signal() {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Phase 1: Minimal logging before config
     let _minimal_guard = quichole_shr::logging::init_minimal_logging();
 
     let args = Args::parse();
     let config = load_config(&args.config)?;
 
-    // Phase 2: Full logging after config
     let (_log_guard, _reload_handle) = quichole_shr::logging::init_logging(&config.logging)
         .context("failed to initialize logging")?;
 
@@ -91,46 +86,15 @@ async fn main() -> Result<()> {
         }
     }
 
-    #[cfg(debug_assertions)]
-    debug_self_check(&client);
-
-    // Create shutdown signal
     let shutdown = ShutdownSignal::new();
     let shutdown_trigger = shutdown.clone();
 
-    // Spawn signal handler task
     tokio::spawn(async move {
         wait_for_shutdown_signal().await;
         shutdown_trigger.shutdown();
     });
 
     run_client(client, shutdown).await
-}
-
-#[cfg(debug_assertions)]
-fn debug_self_check(client: &ClientState) {
-    let (name, _) = match client.config().services.iter().next() {
-        Some(entry) => entry,
-        None => return,
-    };
-
-    let service = match client.service(name) {
-        Some(service) => service,
-        None => return,
-    };
-
-    let hello = control_hello(name);
-    let nonce = generate_nonce();
-    let auth = auth_message(service.token(), &nonce);
-    let _ = verify_ack(&Ack::Ok);
-    let _ = data_channel_hello(nonce);
-
-    tracing::debug!(
-        service = service.name(),
-        hello_version = hello.version(),
-        auth_digest_prefix = format!("{:02x?}", &auth.digest[..4]),
-        "debug client handshake ok"
-    );
 }
 
 #[cfg(test)]

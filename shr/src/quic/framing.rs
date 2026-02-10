@@ -13,13 +13,12 @@ use crate::protocol::{encode_message, FrameDecoder};
 /// # 参数
 /// - `stream`: QUIC 流句柄
 /// - `msg`: 要发送的消息（必须实现 `Serialize`）
-/// - `with_yield`: 是否在发送后执行 yield（服务端需要）
+/// - `_with_wait`: 保留参数，仅为兼容旧调用点；V2 协议不再依赖发送 flush 作为同步语义
 ///
 /// # 实现细节
 /// - 消息会被序列化并添加 4 字节长度前缀
-/// - 服务端模式下（`with_yield = true`）会在发送后执行 10 次 `yield_now()`
-///   以确保数据有机会被发送到网络
-pub async fn send_framed<T>(stream: &QuicStreamHandle, msg: &T, with_yield: bool) -> Result<()>
+/// - 返回值仅表示成功入队到应用发送队列，不代表对端已接收
+pub async fn send_framed<T>(stream: &QuicStreamHandle, msg: &T, _with_wait: bool) -> Result<()>
 where
     T: Serialize,
 {
@@ -29,14 +28,8 @@ where
         len = frame.len(),
         "sending framed message"
     );
-    stream.send(Bytes::from(frame)).await?;
 
-    if with_yield {
-        // 确保数据有机会被发送到网络
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
-        }
-    }
+    stream.send(Bytes::from(frame)).await?;
 
     Ok(())
 }

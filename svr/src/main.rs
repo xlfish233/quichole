@@ -5,9 +5,6 @@ use quichole_shr::logging::ShutdownSignal;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use quichole_shr::crypto::compute_auth_digest;
-use quichole_shr::protocol::{service_digest, Auth, Hello, PROTO_V1};
-use quichole_svr::handshake::begin_control_handshake;
 use quichole_svr::runtime::run_server;
 use quichole_svr::server::ServerState;
 
@@ -35,7 +32,6 @@ fn load_config(path: &Path) -> Result<ServerConfig> {
     Ok(config)
 }
 
-/// Wait for Ctrl+C or SIGTERM and return when received
 async fn wait_for_shutdown_signal() {
     let ctrl_c = async {
         ctrl_c().await.expect("failed to install Ctrl+C handler");
@@ -61,13 +57,11 @@ async fn wait_for_shutdown_signal() {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Phase 1: Minimal logging before config
     let _minimal_guard = quichole_shr::logging::init_minimal_logging();
 
     let args = Args::parse();
     let config = load_config(&args.config)?;
 
-    // Phase 2: Full logging after config
     let (_log_guard, _reload_handle) = quichole_shr::logging::init_logging(&config.logging)
         .context("failed to initialize logging")?;
 
@@ -95,75 +89,15 @@ async fn main() -> Result<()> {
         }
     }
 
-    #[cfg(debug_assertions)]
-    debug_self_check(&server);
-
-    // Create shutdown signal
     let shutdown = ShutdownSignal::new();
     let shutdown_trigger = shutdown.clone();
 
-    // Spawn signal handler task
     tokio::spawn(async move {
         wait_for_shutdown_signal().await;
         shutdown_trigger.shutdown();
     });
 
     run_server(server, shutdown).await
-}
-
-#[cfg(debug_assertions)]
-fn debug_self_check(server: &ServerState) {
-    let (name, _) = match server.config().services.iter().next() {
-        Some(entry) => entry,
-        None => return,
-    };
-
-    let digest = service_digest(name);
-    let hello = Hello::ControlChannelHello {
-        version: PROTO_V1,
-        service_digest: digest,
-    };
-
-    let handshake = match begin_control_handshake(server, &hello) {
-        Ok(handshake) => handshake,
-        Err(err) => {
-            tracing::warn!(error = %err, "debug handshake begin failed");
-            return;
-        }
-    };
-
-    let service = match server.service(name) {
-        Some(service) => service,
-        None => return,
-    };
-
-    let auth = Auth {
-        digest: compute_auth_digest(service.token(), handshake.nonce()),
-    };
-
-    let mut session = match handshake.verify_auth(&auth) {
-        Ok(session) => session,
-        Err(err) => {
-            tracing::warn!(error = %err, "debug handshake auth failed");
-            return;
-        }
-    };
-
-    let (_, session_key) = session.create_data_channel();
-    let data_hello = Hello::DataChannelHello {
-        version: PROTO_V1,
-        session_key,
-    };
-
-    let data_cmd = match session.accept_data_channel_hello(&data_hello) {
-        Ok(cmd) => cmd,
-        Err(err) => {
-            tracing::warn!(error = %err, "debug data channel handshake failed");
-            return;
-        }
-    };
-
-    tracing::debug!(?data_cmd, "debug handshake ok");
 }
 
 #[cfg(test)]

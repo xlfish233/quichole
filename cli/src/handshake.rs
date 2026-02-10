@@ -1,83 +1,97 @@
 use anyhow::{bail, Result};
 use quichole_shr::crypto::compute_auth_digest;
-use quichole_shr::protocol::{Ack, Auth, Hello, PROTO_V1};
+use quichole_shr::protocol::{
+    service_digest, AuthResult, ControlFrame, DataChannelCmd, DataChannelHelloV2, PROTO_V2,
+};
 
-pub fn control_hello(service_name: &str) -> Hello {
-    Hello::ControlChannelHello {
-        version: PROTO_V1,
-        service_digest: quichole_shr::protocol::service_digest(service_name),
+#[derive(Debug, Clone)]
+pub struct ClientHandshakeContext {
+    pub conn_epoch: u64,
+    pub hs_seq: u64,
+}
+
+pub fn client_hello(service_name: &str, conn_epoch: u64, hs_seq: u64) -> ControlFrame {
+    ControlFrame::ClientHello {
+        version: PROTO_V2,
+        service_digest: service_digest(service_name),
+        conn_epoch,
+        hs_seq,
     }
 }
 
-pub fn auth_message(token: &str, nonce: &[u8; 32]) -> Auth {
-    Auth {
+pub fn client_auth(token: &str, nonce: &[u8; 32], ctx: &ClientHandshakeContext) -> ControlFrame {
+    ControlFrame::ClientAuth {
+        conn_epoch: ctx.conn_epoch,
+        hs_seq: ctx.hs_seq,
         digest: compute_auth_digest(token, nonce),
     }
 }
 
-pub fn data_channel_hello(session_key: [u8; 32]) -> Hello {
-    Hello::DataChannelHello {
-        version: PROTO_V1,
+pub fn verify_auth_result(result: &AuthResult) -> Result<()> {
+    match result {
+        AuthResult::Ok => Ok(()),
+        AuthResult::ServiceNotExist => bail!("service not exist"),
+        AuthResult::AuthFailed => bail!("auth failed"),
+    }
+}
+
+pub fn data_channel_hello(
+    conn_epoch: u64,
+    req_id: u64,
+    session_key: [u8; 32],
+) -> DataChannelHelloV2 {
+    DataChannelHelloV2 {
+        version: PROTO_V2,
+        conn_epoch,
+        req_id,
         session_key,
     }
 }
 
-pub fn verify_ack(ack: &Ack) -> Result<()> {
-    match ack {
-        Ack::Ok => Ok(()),
-        Ack::ServiceNotExist => bail!("service not exist"),
-        Ack::AuthFailed => bail!("auth failed"),
+pub fn build_data_channel_resp(
+    conn_epoch: u64,
+    req_id: u64,
+    accepted: bool,
+    error: Option<String>,
+) -> ControlFrame {
+    ControlFrame::OpenDataChannelResp {
+        conn_epoch,
+        req_id,
+        accepted,
+        error,
     }
+}
+
+pub fn map_mode(mode: DataChannelCmd) -> DataChannelCmd {
+    mode
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use quichole_shr::protocol::{service_digest, Hello::ControlChannelHello};
 
     #[test]
-    fn test_control_hello_builds_digest() {
-        let hello = control_hello("ssh");
-        let ControlChannelHello {
-            version,
-            service_digest: digest,
-        } = hello
-        else {
-            panic!("unexpected hello type");
-        };
-
-        assert_eq!(version, PROTO_V1);
-        assert_eq!(digest, service_digest("ssh"));
-    }
-
-    #[test]
-    fn test_auth_message_digest() {
-        let nonce = [1u8; 32];
-        let auth = auth_message("token", &nonce);
-        let expected = compute_auth_digest("token", &nonce);
-        assert_eq!(auth.digest, expected);
-    }
-
-    #[test]
-    fn test_data_channel_hello() {
-        let session_key = [2u8; 32];
-        let hello = data_channel_hello(session_key);
-        match hello {
-            Hello::DataChannelHello {
+    fn test_client_hello_v2() {
+        let frame = client_hello("ssh", 7, 1);
+        match frame {
+            ControlFrame::ClientHello {
                 version,
-                session_key,
+                conn_epoch,
+                hs_seq,
+                ..
             } => {
-                assert_eq!(version, PROTO_V1);
-                assert_eq!(session_key, [2u8; 32]);
+                assert_eq!(version, PROTO_V2);
+                assert_eq!(conn_epoch, 7);
+                assert_eq!(hs_seq, 1);
             }
-            _ => panic!("unexpected hello type"),
+            _ => panic!("unexpected frame"),
         }
     }
 
     #[test]
-    fn test_verify_ack() {
-        assert!(verify_ack(&Ack::Ok).is_ok());
-        assert!(verify_ack(&Ack::ServiceNotExist).is_err());
-        assert!(verify_ack(&Ack::AuthFailed).is_err());
+    fn test_verify_auth_result() {
+        assert!(verify_auth_result(&AuthResult::Ok).is_ok());
+        assert!(verify_auth_result(&AuthResult::ServiceNotExist).is_err());
+        assert!(verify_auth_result(&AuthResult::AuthFailed).is_err());
     }
 }

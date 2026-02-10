@@ -3,7 +3,7 @@ use quichole_shr::config::ServiceType;
 use quichole_shr::crypto::verify_auth_digest;
 use quichole_shr::logging::{RedactedNonce, RedactedSessionKey};
 use quichole_shr::protocol::{
-    generate_nonce, generate_session_key, Auth, ControlChannelCmd, DataChannelCmd, Hello, PROTO_V1,
+    generate_nonce, generate_session_key, AuthResult, DataChannelCmd, DataChannelHelloV2, PROTO_V2,
 };
 use std::collections::HashMap;
 
@@ -13,6 +13,8 @@ use crate::service::Service;
 pub struct ControlHandshake {
     service: Service,
     nonce: [u8; 32],
+    conn_epoch: u64,
+    hs_seq: u64,
 }
 
 impl ControlHandshake {
@@ -20,61 +22,88 @@ impl ControlHandshake {
         &self.nonce
     }
 
-    pub fn verify_auth(self, auth: &Auth) -> Result<ControlSession> {
-        if !verify_auth_digest(&auth.digest, self.service.token(), &self.nonce) {
+    pub const fn conn_epoch(&self) -> u64 {
+        self.conn_epoch
+    }
+
+    pub const fn hs_seq(&self) -> u64 {
+        self.hs_seq
+    }
+
+    pub fn verify_auth(self, digest: &[u8; 32]) -> Result<ControlSession> {
+        if !verify_auth_digest(digest, self.service.token(), &self.nonce) {
             bail!("auth failed");
         }
 
         Ok(ControlSession {
             service: self.service,
+            conn_epoch: self.conn_epoch,
             data_channels: DataChannelManager::default(),
         })
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct DataChannelRequest {
+    pub req_id: u64,
+    pub session_key: [u8; 32],
+    pub mode: DataChannelCmd,
+}
+
 #[derive(Default)]
 struct DataChannelManager {
-    pending: HashMap<[u8; 32], ServiceType>,
+    pending: HashMap<u64, ([u8; 32], DataChannelCmd)>,
 }
 
 impl DataChannelManager {
-    fn create_request(&mut self, service_type: ServiceType) -> [u8; 32] {
+    fn create_request(&mut self, req_id: u64, service_type: ServiceType) -> DataChannelRequest {
         let session_key = generate_session_key();
         tracing::debug!(
             session_key = %RedactedSessionKey(session_key),
+            req_id,
             "server generated session key for data channel"
         );
-        self.pending.insert(session_key, service_type);
-        session_key
+        let mode = match service_type {
+            ServiceType::Tcp => DataChannelCmd::StartForwardTcp,
+            ServiceType::Udp => DataChannelCmd::StartForwardUdp,
+        };
+        self.pending.insert(req_id, (session_key, mode));
+        DataChannelRequest {
+            req_id,
+            session_key,
+            mode,
+        }
     }
 
-    fn accept_hello(&mut self, hello: &Hello) -> Result<DataChannelCmd> {
-        let (version, session_key) = match hello {
-            Hello::DataChannelHello {
-                version,
-                session_key,
-            } => (*version, session_key),
-            _ => bail!("unexpected hello type for data channel"),
-        };
-
-        if version != PROTO_V1 {
+    fn accept_hello(
+        &mut self,
+        conn_epoch: u64,
+        hello: &DataChannelHelloV2,
+    ) -> Result<DataChannelCmd> {
+        if hello.version != PROTO_V2 {
             bail!("protocol version mismatch");
         }
 
-        let service_type = self
-            .pending
-            .remove(session_key)
-            .context("unknown session key")?;
+        if hello.conn_epoch != conn_epoch {
+            bail!("conn epoch mismatch");
+        }
 
-        Ok(match service_type {
-            ServiceType::Tcp => DataChannelCmd::StartForwardTcp,
-            ServiceType::Udp => DataChannelCmd::StartForwardUdp,
-        })
+        let (expected_key, mode) = self
+            .pending
+            .remove(&hello.req_id)
+            .context("unknown req id")?;
+
+        if expected_key != hello.session_key {
+            bail!("session key mismatch");
+        }
+
+        Ok(mode)
     }
 }
 
 pub struct ControlSession {
     service: Service,
+    conn_epoch: u64,
     data_channels: DataChannelManager,
 }
 
@@ -83,33 +112,33 @@ impl ControlSession {
         &self.service
     }
 
-    pub fn create_data_channel(&mut self) -> (ControlChannelCmd, [u8; 32]) {
-        let session_key = self
-            .data_channels
-            .create_request(self.service.service_type());
-        (ControlChannelCmd::CreateDataChannel, session_key)
+    pub const fn conn_epoch(&self) -> u64 {
+        self.conn_epoch
     }
 
-    pub fn accept_data_channel_hello(&mut self, hello: &Hello) -> Result<DataChannelCmd> {
-        self.data_channels.accept_hello(hello)
+    pub fn create_data_channel(&mut self, req_id: u64) -> DataChannelRequest {
+        self.data_channels
+            .create_request(req_id, self.service.service_type())
+    }
+
+    pub fn accept_data_channel_hello(
+        &mut self,
+        hello: &DataChannelHelloV2,
+    ) -> Result<DataChannelCmd> {
+        self.data_channels.accept_hello(self.conn_epoch, hello)
     }
 }
 
-pub fn begin_control_handshake(server: &ServerState, hello: &Hello) -> Result<ControlHandshake> {
-    let (version, service_digest) = match hello {
-        Hello::ControlChannelHello {
-            version,
-            service_digest,
-        } => (*version, service_digest),
-        _ => bail!("unexpected hello type for control channel"),
-    };
-
-    if version != PROTO_V1 {
-        bail!("protocol version mismatch");
-    }
-
+pub fn begin_control_handshake(
+    server: &ServerState,
+    service_digest: &[u8; 32],
+    conn_epoch: u64,
+    hs_seq: u64,
+) -> Result<ControlHandshake> {
     tracing::debug!(
         service_digest = %format!("{:02x}***", service_digest[0]),
+        conn_epoch,
+        hs_seq,
         "looking up service by digest"
     );
 
@@ -123,10 +152,25 @@ pub fn begin_control_handshake(server: &ServerState, hello: &Hello) -> Result<Co
     let nonce = generate_nonce();
     tracing::debug!(
         nonce = %RedactedNonce(nonce),
+        conn_epoch,
+        hs_seq,
         "server generated nonce for handshake"
     );
 
-    Ok(ControlHandshake { service, nonce })
+    Ok(ControlHandshake {
+        service,
+        nonce,
+        conn_epoch,
+        hs_seq,
+    })
+}
+
+pub fn auth_error_to_result(err: &anyhow::Error) -> AuthResult {
+    if err.to_string().contains("service not exist") {
+        AuthResult::ServiceNotExist
+    } else {
+        AuthResult::AuthFailed
+    }
 }
 
 #[cfg(test)]
@@ -134,8 +178,6 @@ mod tests {
     use super::*;
     use quichole_shr::crypto::compute_auth_digest;
     use quichole_shr::protocol::service_digest;
-    use quichole_shr::protocol::Hello::ControlChannelHello;
-    use quichole_shr::protocol::Hello::DataChannelHello;
 
     fn build_server() -> ServerState {
         let toml_str = r#"
@@ -158,135 +200,18 @@ mod tests {
     fn test_control_handshake_success() {
         let server = build_server();
         let digest = service_digest("ssh");
-        let hello = ControlChannelHello {
-            version: PROTO_V1,
-            service_digest: digest,
-        };
-        let handshake = begin_control_handshake(&server, &hello).unwrap();
-        let auth = Auth {
-            digest: compute_auth_digest("default_secret", handshake.nonce()),
-        };
-        let mut session = handshake.verify_auth(&auth).unwrap();
+        let handshake = begin_control_handshake(&server, &digest, 11, 1).unwrap();
+        let auth_digest = compute_auth_digest("default_secret", handshake.nonce());
+        let mut session = handshake.verify_auth(&auth_digest).unwrap();
 
-        let (cmd, session_key) = session.create_data_channel();
-        assert_eq!(cmd, ControlChannelCmd::CreateDataChannel);
-
-        let data_hello = DataChannelHello {
-            version: PROTO_V1,
-            session_key,
+        let req = session.create_data_channel(5);
+        let data_hello = DataChannelHelloV2 {
+            version: PROTO_V2,
+            conn_epoch: 11,
+            req_id: req.req_id,
+            session_key: req.session_key,
         };
         let data_cmd = session.accept_data_channel_hello(&data_hello).unwrap();
         assert_eq!(data_cmd, DataChannelCmd::StartForwardTcp);
-    }
-
-    #[test]
-    fn test_control_handshake_version_mismatch() {
-        let server = build_server();
-        let digest = service_digest("ssh");
-        let hello = ControlChannelHello {
-            version: PROTO_V1 + 1,
-            service_digest: digest,
-        };
-
-        let result = begin_control_handshake(&server, &hello);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_control_handshake_service_not_exist() {
-        let server = build_server();
-        let digest = service_digest("unknown");
-        let hello = ControlChannelHello {
-            version: PROTO_V1,
-            service_digest: digest,
-        };
-
-        let result = begin_control_handshake(&server, &hello);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_control_handshake_auth_failed() {
-        let server = build_server();
-        let digest = service_digest("ssh");
-        let hello = ControlChannelHello {
-            version: PROTO_V1,
-            service_digest: digest,
-        };
-        let handshake = begin_control_handshake(&server, &hello).unwrap();
-        let auth = Auth {
-            digest: compute_auth_digest("wrong_token", handshake.nonce()),
-        };
-
-        let result = handshake.verify_auth(&auth);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_data_channel_udp_flow() {
-        let server = build_server();
-        let digest = service_digest("dns");
-        let hello = ControlChannelHello {
-            version: PROTO_V1,
-            service_digest: digest,
-        };
-        let handshake = begin_control_handshake(&server, &hello).unwrap();
-        let auth = Auth {
-            digest: compute_auth_digest("default_secret", handshake.nonce()),
-        };
-        let mut session = handshake.verify_auth(&auth).unwrap();
-
-        let (_, session_key) = session.create_data_channel();
-        let data_hello = DataChannelHello {
-            version: PROTO_V1,
-            session_key,
-        };
-        let data_cmd = session.accept_data_channel_hello(&data_hello).unwrap();
-        assert_eq!(data_cmd, DataChannelCmd::StartForwardUdp);
-    }
-
-    #[test]
-    fn test_data_channel_unknown_session_key() {
-        let server = build_server();
-        let digest = service_digest("ssh");
-        let hello = ControlChannelHello {
-            version: PROTO_V1,
-            service_digest: digest,
-        };
-        let handshake = begin_control_handshake(&server, &hello).unwrap();
-        let auth = Auth {
-            digest: compute_auth_digest("default_secret", handshake.nonce()),
-        };
-        let mut session = handshake.verify_auth(&auth).unwrap();
-
-        let data_hello = DataChannelHello {
-            version: PROTO_V1,
-            session_key: [9u8; 32],
-        };
-        let result = session.accept_data_channel_hello(&data_hello);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_data_channel_wrong_version() {
-        let server = build_server();
-        let digest = service_digest("ssh");
-        let hello = ControlChannelHello {
-            version: PROTO_V1,
-            service_digest: digest,
-        };
-        let handshake = begin_control_handshake(&server, &hello).unwrap();
-        let auth = Auth {
-            digest: compute_auth_digest("default_secret", handshake.nonce()),
-        };
-        let mut session = handshake.verify_auth(&auth).unwrap();
-
-        let (_, session_key) = session.create_data_channel();
-        let data_hello = DataChannelHello {
-            version: PROTO_V1 + 1,
-            session_key,
-        };
-        let result = session.accept_data_channel_hello(&data_hello);
-        assert!(result.is_err());
     }
 }

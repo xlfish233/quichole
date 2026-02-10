@@ -3,9 +3,9 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use quichole_shr::config::{ServiceType, TlsConfig};
 use quichole_shr::logging::ShutdownSignal;
-use quichole_shr::protocol::{encode_message, FrameDecoder};
 use quichole_shr::protocol::{
-    Ack, Auth, ControlChannelCmd, DataChannelCmd, Hello, UdpTraffic, PROTO_V1,
+    encode_message, AuthResult, ControlFrame, DataChannelCmd, DataChannelHelloV2, FrameDecoder,
+    UdpTraffic,
 };
 use quichole_shr::quic::{
     build_server_tls_hooks, forward_tcp_bidirectional, recv_framed, send_framed, QuicApp,
@@ -17,14 +17,49 @@ use std::sync::Arc;
 use std::time::Duration as StdDuration;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, oneshot};
-use tokio::time::{interval, Duration, Instant, MissedTickBehavior};
+use tokio::time::{interval, timeout, Duration, Instant, MissedTickBehavior};
 use tokio_quiche::metrics::{DefaultMetrics, Metrics};
 use tokio_quiche::quic::SimpleConnectionIdGenerator;
 use tokio_quiche::settings::{CertificateKind, QuicSettings, TlsCertificatePaths};
 use tokio_quiche::{listen, ConnectionParams};
 
-use crate::handshake::begin_control_handshake;
+use crate::handshake::{
+    auth_error_to_result, begin_control_handshake, ControlSession, DataChannelRequest,
+};
 use crate::server::ServerState;
+
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(800);
+const HANDSHAKE_MAX_RETRY: u32 = 2;
+const DATA_CHANNEL_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Debug)]
+struct ControlContext {
+    conn_epoch: u64,
+    hs_seq: u64,
+    tick: u64,
+    next_req_id: u64,
+}
+
+impl ControlContext {
+    fn new(conn_epoch: u64) -> Self {
+        Self {
+            conn_epoch,
+            hs_seq: 1,
+            tick: 0,
+            next_req_id: 1,
+        }
+    }
+
+    fn next_req_id(&mut self) -> u64 {
+        let req_id = self.next_req_id;
+        self.next_req_id = self.next_req_id.saturating_add(1);
+        req_id
+    }
+
+    fn validate_epoch(&self, incoming_epoch: u64) -> bool {
+        incoming_epoch == self.conn_epoch
+    }
+}
 
 pub async fn run_server(server: ServerState, shutdown: ShutdownSignal) -> Result<()> {
     let server = Arc::new(server);
@@ -49,17 +84,20 @@ pub async fn run_server(server: ServerState, shutdown: ShutdownSignal) -> Result
     tracing::info!(bind_addr = %bind_addr, "quic listener started");
 
     let mut shutdown_rx = shutdown.subscribe();
+    let mut conn_id = 0_u64;
 
     loop {
         tokio::select! {
             conn_result = listener.next() => {
                 match conn_result {
                     Some(Ok(conn)) => {
+                        conn_id = conn_id.saturating_add(1);
                         let server = server.clone();
                         let shutdown = shutdown.clone();
+                        let this_conn_id = conn_id;
                         tokio::spawn(async move {
-                            if let Err(err) = handle_connection(server, conn, shutdown).await {
-                                tracing::warn!(error = %err, "quic connection ended");
+                            if let Err(err) = handle_connection(server, conn, shutdown, this_conn_id).await {
+                                tracing::warn!(error = %err, conn_id = this_conn_id, "quic connection ended");
                             }
                         });
                     }
@@ -83,12 +121,10 @@ pub async fn run_server(server: ServerState, shutdown: ShutdownSignal) -> Result
 }
 
 fn build_server_params(tls: &TlsConfig) -> Result<ConnectionParams<'_>> {
-    // Validate configuration
     tls.validate_server()?;
 
-    // Extract parameters - using as_deref() to keep them as &str in this scope
-    let cert = tls.cert.as_deref().unwrap(); // safe after validation
-    let key = tls.key.as_deref().unwrap(); // safe after validation
+    let cert = tls.cert.as_deref().unwrap();
+    let key = tls.key.as_deref().unwrap();
     let ca = tls
         .ca
         .as_deref()
@@ -102,6 +138,8 @@ fn build_server_params(tls: &TlsConfig) -> Result<ConnectionParams<'_>> {
     };
 
     let mut settings = QuicSettings::default();
+    settings.max_ack_delay = 100;
+
     if let Some(timeout_ms) = std::env::var("QUIC_IDLE_TIMEOUT_MS")
         .ok()
         .and_then(|val| val.parse::<u64>().ok())
@@ -122,48 +160,41 @@ struct PreparedDataStream {
     mode: DataChannelCmd,
 }
 
+struct PendingDataRequest {
+    request: DataChannelRequest,
+    response: oneshot::Sender<Result<PreparedDataStream>>,
+    created_at: Instant,
+}
+
+struct DataChannelHelloEvent {
+    stream: QuicStreamHandle,
+    hello: Result<DataChannelHelloV2>,
+}
+
 async fn handle_connection<M>(
     server: Arc<ServerState>,
     conn: tokio_quiche::InitialQuicConnection<tokio::net::UdpSocket, M>,
     shutdown: ShutdownSignal,
+    conn_id: u64,
 ) -> Result<()>
 where
     M: Metrics,
 {
     let (app, handle) = QuicApp::new(quichole_shr::quic::CONTROL_STREAM_ID);
     let _conn = conn.start(app);
-    tracing::debug!("quic connection started");
+    tracing::debug!(conn_id, "quic connection started");
 
     let (mut control_stream, manager) = handle.split();
     let mut control_decoder = FrameDecoder::new();
+    let mut control_ctx = ControlContext::new(0);
 
-    let hello: Hello = recv_framed(&mut control_stream, &mut control_decoder).await?;
-    if hello.version() != PROTO_V1 {
-        return Err(anyhow!("protocol version mismatch"));
-    }
-
-    tracing::debug!("beginning control handshake");
-    let handshake = begin_control_handshake(&server, &hello)?;
-    tracing::debug!("sending nonce");
-    send_framed(&control_stream, handshake.nonce(), true).await?;
-    tracing::debug!("nonce sent, yielding multiple times");
-    for _ in 0..5 {
-        tokio::task::yield_now().await;
-    }
-    tracing::debug!("receiving auth");
-
-    let auth: Auth = recv_framed(&mut control_stream, &mut control_decoder).await?;
-    let session = match handshake.verify_auth(&auth) {
-        Ok(session) => {
-            send_framed(&control_stream, &Ack::Ok, true).await?;
-            tracing::debug!("control handshake completed");
-            session
-        }
-        Err(err) => {
-            send_framed(&control_stream, &Ack::AuthFailed, true).await?;
-            return Err(err);
-        }
-    };
+    let session = server_handshake(
+        &server,
+        &mut control_stream,
+        &mut control_decoder,
+        &mut control_ctx,
+    )
+    .await?;
 
     let service = session.service().clone();
     let (req_tx, req_rx) = mpsc::channel(64);
@@ -173,13 +204,13 @@ where
         .heartbeat_ack_timeout
         .unwrap_or_else(|| heartbeat_interval.saturating_mul(3).max(3));
 
-    // Clone shutdown for use in both tasks
     let shutdown_for_control = shutdown.clone();
     let shutdown_for_service = shutdown.clone();
 
     tokio::spawn(async move {
         if let Err(err) = control_task_with_shutdown(
             session,
+            control_ctx,
             control_stream,
             manager,
             req_rx,
@@ -215,8 +246,113 @@ where
     Ok(())
 }
 
+async fn server_handshake(
+    server: &ServerState,
+    control_stream: &mut QuicStreamHandle,
+    control_decoder: &mut FrameDecoder,
+    control_ctx: &mut ControlContext,
+) -> Result<ControlSession> {
+    for retry in 0..=HANDSHAKE_MAX_RETRY {
+        let frame = timeout(
+            HANDSHAKE_TIMEOUT,
+            recv_framed::<ControlFrame>(control_stream, control_decoder),
+        )
+        .await
+        .context("timeout waiting client hello")??;
+
+        let (version, service_digest, conn_epoch, hs_seq) = match frame {
+            ControlFrame::ClientHello {
+                version,
+                service_digest,
+                conn_epoch,
+                hs_seq,
+            } => (version, service_digest, conn_epoch, hs_seq),
+            other => {
+                tracing::warn!(retry, frame = ?other, "unexpected control frame before handshake");
+                continue;
+            }
+        };
+
+        if version != quichole_shr::protocol::PROTO_V2 {
+            tracing::warn!(retry, version, "protocol version mismatch");
+            continue;
+        }
+
+        control_ctx.conn_epoch = conn_epoch;
+        control_ctx.hs_seq = hs_seq;
+
+        let handshake = match begin_control_handshake(server, &service_digest, conn_epoch, hs_seq) {
+            Ok(handshake) => handshake,
+            Err(err) => {
+                let result = auth_error_to_result(&err);
+                let auth_result = ControlFrame::ServerAuthResult {
+                    conn_epoch,
+                    hs_seq,
+                    result,
+                };
+                send_framed(control_stream, &auth_result, false).await?;
+                return Err(err);
+            }
+        };
+
+        let challenge = ControlFrame::ServerChallenge {
+            conn_epoch,
+            hs_seq,
+            nonce: *handshake.nonce(),
+        };
+        send_framed(control_stream, &challenge, false).await?;
+
+        let auth_frame = timeout(
+            HANDSHAKE_TIMEOUT,
+            recv_framed::<ControlFrame>(control_stream, control_decoder),
+        )
+        .await
+        .context("timeout waiting client auth")??;
+
+        let digest = match auth_frame {
+            ControlFrame::ClientAuth {
+                conn_epoch: recv_epoch,
+                hs_seq: recv_hs_seq,
+                digest,
+            } if recv_epoch == conn_epoch && recv_hs_seq == hs_seq => digest,
+            other => {
+                tracing::warn!(retry, frame = ?other, "unexpected client auth frame");
+                continue;
+            }
+        };
+
+        let session = match handshake.verify_auth(&digest) {
+            Ok(session) => {
+                let auth_result = ControlFrame::ServerAuthResult {
+                    conn_epoch,
+                    hs_seq,
+                    result: AuthResult::Ok,
+                };
+                send_framed(control_stream, &auth_result, false).await?;
+                session
+            }
+            Err(err) => {
+                let auth_result = ControlFrame::ServerAuthResult {
+                    conn_epoch,
+                    hs_seq,
+                    result: AuthResult::AuthFailed,
+                };
+                send_framed(control_stream, &auth_result, false).await?;
+                return Err(err);
+            }
+        };
+
+        let ready = ControlFrame::ControlReady { conn_epoch };
+        send_framed(control_stream, &ready, false).await?;
+        return Ok(session);
+    }
+
+    Err(anyhow!("server handshake failed after retries"))
+}
+
 async fn control_task_with_shutdown(
-    mut session: crate::handshake::ControlSession,
+    mut session: ControlSession,
+    mut control_ctx: ControlContext,
     mut control_stream: QuicStreamHandle,
     mut manager: QuicStreamManager,
     mut req_rx: mpsc::Receiver<ControlRequest>,
@@ -230,28 +366,77 @@ async fn control_task_with_shutdown(
     let mut last_heartbeat = Instant::now();
     let mut control_decoder = FrameDecoder::new();
     let mut shutdown_rx = shutdown.subscribe();
+    let mut pending_requests: HashMap<u64, PendingDataRequest> = HashMap::new();
+    let (hello_tx, mut hello_rx) = mpsc::channel::<DataChannelHelloEvent>(128);
+    let mut cleanup_tick = interval(Duration::from_millis(200));
+    cleanup_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
             _ = ticker.tick() => {
-                // Keep the QUIC connection alive and give clients a liveness signal.
-                // Client currently ignores the payload but reading it resets its idle timer.
-                send_framed(&control_stream, &ControlChannelCmd::Heartbeat, true).await?;
+                control_ctx.tick = control_ctx.tick.saturating_add(1);
+                let heartbeat = ControlFrame::Heartbeat {
+                    conn_epoch: control_ctx.conn_epoch,
+                    tick: control_ctx.tick,
+                };
+                send_framed(&control_stream, &heartbeat, false).await?;
                 if last_heartbeat.elapsed() > heartbeat_timeout {
                     return Err(anyhow!("control heartbeat timeout"));
                 }
             }
-            cmd = recv_framed::<ControlChannelCmd>(&mut control_stream, &mut control_decoder) => {
-                match cmd {
-                    Ok(ControlChannelCmd::Heartbeat) => {
-                        last_heartbeat = Instant::now();
+            frame = recv_framed::<ControlFrame>(&mut control_stream, &mut control_decoder) => {
+                let frame = frame?;
+                if let Some(epoch) = frame.conn_epoch() {
+                    if !control_ctx.validate_epoch(epoch) {
+                        tracing::warn!(expected = control_ctx.conn_epoch, got = epoch, "drop stale frame in control task");
+                        continue;
                     }
-                    Ok(other) => {
-                        tracing::warn!(cmd = ?other, "unexpected control cmd from client");
+                }
+
+                match frame {
+                    ControlFrame::Heartbeat { tick, .. } => {
+                        if tick >= control_ctx.tick {
+                            last_heartbeat = Instant::now();
+                        }
                     }
-                    Err(err) => {
-                        return Err(err);
+                    ControlFrame::OpenDataChannelResp {
+                        conn_epoch: _,
+                        req_id,
+                        accepted,
+                        error,
+                    } => {
+                        if !accepted {
+                            tracing::warn!(req_id, error = ?error, "client rejected data channel request");
+                        }
                     }
+                    other => {
+                        tracing::warn!(frame = ?other, "unexpected control frame from client");
+                    }
+                }
+            }
+            accepted = manager.accept_stream() => {
+                let Some(data_stream) = accepted else {
+                    break;
+                };
+
+                let hello_tx = hello_tx.clone();
+                tokio::spawn(async move {
+                    let event = recv_data_channel_hello(data_stream).await;
+                    let _ = hello_tx.send(event).await;
+                });
+            }
+            hello_event = hello_rx.recv() => {
+                let Some(hello_event) = hello_event else {
+                    break;
+                };
+
+                if let Err(err) = prepare_data_stream(
+                    hello_event,
+                    &mut session,
+                    control_ctx.conn_epoch,
+                    &mut pending_requests,
+                ) {
+                    tracing::warn!(error = %err, "failed to prepare data stream");
                 }
             }
             request = req_rx.recv() => {
@@ -259,33 +444,28 @@ async fn control_task_with_shutdown(
                     break;
                 };
 
-                tracing::debug!("requesting data channel");
-                let (cmd, session_key) = session.create_data_channel();
-                send_framed(&control_stream, &cmd, true).await?;
-                send_framed(&control_stream, &session_key, true).await?;
-
-                let mut data_stream = manager
-                    .accept_stream()
-                    .await
-                    .ok_or_else(|| anyhow!("data stream closed"))?;
-                let stream_id = data_stream.id();
-                tracing::debug!(stream_id, "data stream accepted");
-                let mut data_decoder = FrameDecoder::new();
-                let hello: Hello = match recv_framed(&mut data_stream, &mut data_decoder).await {
-                    Ok(hello) => hello,
-                    Err(err) => {
-                        tracing::warn!(error = %err, stream_id, "data channel hello failed");
-                        return Err(err);
-                    }
+                let req_id = control_ctx.next_req_id();
+                let req = session.create_data_channel(req_id);
+                let mode = req.mode;
+                let open_req = ControlFrame::OpenDataChannelReq {
+                    conn_epoch: control_ctx.conn_epoch,
+                    req_id: req.req_id,
+                    session_key: req.session_key,
+                    mode,
                 };
-                let data_cmd = session.accept_data_channel_hello(&hello)?;
-                send_framed(&data_stream, &data_cmd, true).await?;
-                tracing::debug!(mode = ?data_cmd, "data channel ready");
+                send_framed(&control_stream, &open_req, false).await?;
 
-                let _ = request.response.send(Ok(PreparedDataStream {
-                    stream: data_stream,
-                    mode: data_cmd,
-                }));
+                pending_requests.insert(
+                    req.req_id,
+                    PendingDataRequest {
+                        request: req,
+                        response: request.response,
+                        created_at: Instant::now(),
+                    },
+                );
+            }
+            _ = cleanup_tick.tick() => {
+                timeout_pending_data_requests(&mut pending_requests);
             }
             _ = shutdown_rx.recv() => {
                 tracing::info!("shutdown signal received in control task");
@@ -294,7 +474,93 @@ async fn control_task_with_shutdown(
         }
     }
 
+    for (_, pending) in pending_requests.drain() {
+        let _ = pending
+            .response
+            .send(Err(anyhow!("control channel closed")));
+    }
+
     Ok(())
+}
+
+async fn recv_data_channel_hello(mut data_stream: QuicStreamHandle) -> DataChannelHelloEvent {
+    let stream_id = data_stream.id();
+    tracing::debug!(stream_id, "data stream accepted");
+
+    let mut data_decoder = FrameDecoder::new();
+    let hello = async {
+        let hello: DataChannelHelloV2 = timeout(
+            DATA_CHANNEL_OPEN_TIMEOUT,
+            recv_framed(&mut data_stream, &mut data_decoder),
+        )
+        .await
+        .context("timeout waiting data channel hello")??;
+        Ok::<DataChannelHelloV2, anyhow::Error>(hello)
+    }
+    .await;
+
+    DataChannelHelloEvent {
+        stream: data_stream,
+        hello,
+    }
+}
+
+fn prepare_data_stream(
+    hello_event: DataChannelHelloEvent,
+    session: &mut ControlSession,
+    conn_epoch: u64,
+    pending_requests: &mut HashMap<u64, PendingDataRequest>,
+) -> Result<()> {
+    let DataChannelHelloEvent { stream, hello } = hello_event;
+    let stream_id = stream.id();
+    let hello = hello?;
+
+    let Some(pending) = pending_requests.remove(&hello.req_id) else {
+        return Err(anyhow!("unknown req id {}", hello.req_id));
+    };
+
+    if hello.conn_epoch != conn_epoch {
+        let _ = pending
+            .response
+            .send(Err(anyhow!("data channel conn epoch mismatch")));
+        return Err(anyhow!("data channel conn epoch mismatch"));
+    }
+
+    if hello.req_id != pending.request.req_id {
+        let _ = pending
+            .response
+            .send(Err(anyhow!("data channel req id mismatch")));
+        return Err(anyhow!("data channel req id mismatch"));
+    }
+
+    let mode = session.accept_data_channel_hello(&hello)?;
+    let _ = pending
+        .response
+        .send(Ok(PreparedDataStream { stream, mode }));
+    tracing::debug!(stream_id, req_id = hello.req_id, "data stream prepared");
+    Ok(())
+}
+
+fn timeout_pending_data_requests(pending_requests: &mut HashMap<u64, PendingDataRequest>) {
+    let now = Instant::now();
+    let timeout_reqs: Vec<u64> = pending_requests
+        .iter()
+        .filter_map(|(&req_id, pending)| {
+            if now.duration_since(pending.created_at) >= DATA_CHANNEL_OPEN_TIMEOUT {
+                Some(req_id)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    for req_id in timeout_reqs {
+        if let Some(pending) = pending_requests.remove(&req_id) {
+            let _ = pending
+                .response
+                .send(Err(anyhow!("data stream open timeout")));
+        }
+    }
 }
 
 async fn run_tcp_service_with_shutdown(
@@ -372,27 +638,26 @@ async fn run_udp_service_with_shutdown(
             }
             recv = socket.recv_from(&mut buf) => {
                 let (n, peer) = recv?;
-        let sender = if let Some(session) = sessions.get(&peer) {
-            session.sender.clone()
-        } else {
-            let prepared = request_data_stream(req_tx.clone()).await?;
-            if prepared.mode != DataChannelCmd::StartForwardUdp {
-                tracing::warn!(mode = ?prepared.mode, "unexpected data channel mode for udp");
-                continue;
-            }
-            let (tx, rx) = prepared.stream.split();
-            let udp = socket.clone();
-            spawn_udp_to_visitor(peer, udp.clone(), rx)?;
-            sessions.insert(peer, UdpSession { sender: tx.clone() });
-            tx
-        };
+                let sender = if let Some(session) = sessions.get(&peer) {
+                    session.sender.clone()
+                } else {
+                    let prepared = request_data_stream(req_tx.clone()).await?;
+                    if prepared.mode != DataChannelCmd::StartForwardUdp {
+                        tracing::warn!(mode = ?prepared.mode, "unexpected data channel mode for udp");
+                        continue;
+                    }
+                    let (tx, rx) = prepared.stream.split();
+                    spawn_udp_to_visitor(peer, socket.clone(), rx)?;
+                    sessions.insert(peer, UdpSession { sender: tx.clone() });
+                    tx
+                };
 
-        let traffic = UdpTraffic {
-            from: peer,
-            data: Bytes::copy_from_slice(&buf[..n]),
-        };
-        let frame = encode_message(&traffic)?;
-        sender.send(Bytes::from(frame)).await?;
+                let traffic = UdpTraffic {
+                    from: peer,
+                    data: Bytes::copy_from_slice(&buf[..n]),
+                };
+                let frame = encode_message(&traffic)?;
+                sender.send(Bytes::from(frame)).await?;
             }
             _ = shutdown_rx.recv() => {
                 tracing::info!(bind_addr = %bind_addr, "shutdown signal received, stopping udp service");
